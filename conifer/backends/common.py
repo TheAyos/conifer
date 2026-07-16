@@ -238,32 +238,57 @@ def read_hls_log(filename: str) -> dict:
     return None
 
 def read_vsynth_report(filename):
-  section = 0
-  if os.path.exists(filename):
-    report = {}
-    f = open(filename, 'r')
-    for line in f.readlines():
-      # track which report section the line is in for filtering
-      if '1. CLB Logic' in line:
-        section = 1
-      elif '1.1 Summary of Registers by Type' in line:
-        section = 1.1
-      elif '2. BLOCKRAM' in line:
-        section = 2
-      elif '3. ARITHMETIC' in line:
-        section = 3
-      elif '4. I/O' in line:
-        section = 4
-
-      # extract the value from the tables in each section
-      if section == 1 and 'CLB LUTs*' in line:
-        report['lut'] = int(line.split('|')[2])
-      elif section == 1 and 'CLB Registers' in line:
-        report['ff'] = int(line.split('|')[2])
-      elif section == 2 and 'RAMB18' in line and 'Note' not in line:
-        report['bram18'] = int(line.split('|')[2])
-      elif section == 3 and 'DSPs' in line:
-        report['dsp'] = int(line.split('|')[2])
-    return report
-  else:
+  '''
+  Extract resource usage from the Vivado RTL synthesis utilization report
+  The report vocabulary depends on the device family, and is detected from the report itself:
+  7-series parts (e.g. PYNQ-Z2, Zynq-7000, Artix-7) report "Slice" logic, while
+  UltraScale/UltraScale+ parts (e.g. Alveo) report "CLB" logic.
+  Parameters
+  ----------
+  filename : string
+    Name of the Vivado synthesis report file
+  Returns
+  ----------
+  dictionary of extracted report contents
+  '''
+  if not os.path.exists(filename):
     return None
+
+  with open(filename, 'r') as f:
+    lines = f.readlines()
+
+  # detect the device family, then select the section headings and table row labels to match
+  # TODO: based on 2024.1 for now, test against other versions
+  series7 = any('1. Slice Logic' in line or 'Slice LUTs' in line for line in lines)
+  if series7:
+    logic_heading, bram_heading, dsp_heading, io_heading = '1. Slice Logic', '2. Memory', '3. DSP', '4. IO and GT Specific'
+    lut_label, ff_label = 'Slice LUTs*', 'Slice Registers'
+  else:
+    logic_heading, bram_heading, dsp_heading, io_heading = '1. CLB Logic', '2. BLOCKRAM', '3. ARITHMETIC', '4. I/O'
+    lut_label, ff_label = 'CLB LUTs*', 'CLB Registers'
+
+  section = 0
+  report = {}
+  for line in lines:
+    # track which report section the line is in for filtering
+    if logic_heading in line:
+      section = 1
+    elif '1.1 Summary of Registers by Type' in line:
+      section = 1.1
+    elif bram_heading in line:
+      section = 2
+    elif dsp_heading in line:
+      section = 3
+    elif io_heading in line:
+      section = 4
+
+    # extract the value from the tables in each section
+    if section == 1 and lut_label in line:
+      report['lut'] = int(line.split('|')[2])
+    elif section == 1 and ff_label in line:
+      report['ff'] = int(line.split('|')[2])
+    elif section == 2 and 'RAMB18' in line and 'Note' not in line:
+      report['bram18'] = int(line.split('|')[2])
+    elif section == 3 and 'DSPs' in line:
+      report['dsp'] = int(line.split('|')[2])
+  return report
