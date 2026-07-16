@@ -635,7 +635,14 @@ class XilinxHLSModel(ModelBase):
 
         vsynth_report = read_vsynth_report(f'{self.config.output_dir}/vivado_synth.rpt')
         if vsynth_report is not None:
-            report['vsynth'] = {'lut' : vsynth_report['lut'], 'ff' : vsynth_report['ff'], 'dsp' : vsynth_report['dsp']}
+            keys = ['lut', 'ff', 'dsp']
+            missing = [key for key in keys if key not in vsynth_report]
+            if not missing:
+                report['vsynth'] = {key : vsynth_report[key] for key in keys}
+            else:
+                # the report exists but doesn't look like either device family's format
+                logger.warn(f'Found a Vivado synthesis report but could not parse {missing} from it. '
+                            'The report format was not recognised.')
         return report
 
 def auto_config(granularity='simple'):
