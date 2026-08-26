@@ -9,5 +9,7 @@
   "tile_memory_bytes": 65536,
   "memtile_bytes": 524288,
   "plio_columns": 28,
-  "clock_ghz": 1.25
+  "clock_ghz": 1.25,
+  "plio_rate_mhz": 625,
+  "plio_rate_mhz_max": 1250
 }

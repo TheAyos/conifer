@@ -277,10 +277,35 @@ def test_sharding_can_be_turned_off(skl_model, tmp_path):
     assert '#define BDT_SHARDED 0' in open(tmp_path / 'src/parameters.h').read()
 
 
-def test_memtile_can_be_declined_while_sharding(skl_model, tmp_path):
+def test_declining_the_memtile_also_declines_sharding(skl_model, tmp_path):
+    """Only a memtile can hand each tile its own rows; a PLIO multicasts one stream"""
     model = _sharded(skl_model, tmp_path, Feed='plio')
-    assert model.sharding is not None
+    assert model.sharding is None
     assert not model.feed_memtile
+    model.write()
+    assert '#define BDT_SHARDED 0' in open(tmp_path / 'src/parameters.h').read()
+
+
+def test_plio_rate_defaults_to_the_device_and_is_capped(skl_model, tmp_path):
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path))
+    assert model.plio_rate == model.device['plio_rate_mhz']
+    with pytest.raises(ValueError, match='exceeds'):
+        conifer.converters.convert_from_sklearn(
+            clf, _config(tmp_path / 'x', PlioRate=99999))
+
+
+def test_wide_feature_models_are_accepted(tmp_path):
+    """The 64-feature bound was the feature-mask experiment, which no longer ships"""
+    from sklearn.datasets import make_classification
+    from sklearn.ensemble import GradientBoostingClassifier
+    X, y = make_classification(n_samples=400, n_features=128, n_informative=20,
+                               random_state=0)
+    clf = GradientBoostingClassifier(n_estimators=8, max_depth=3, random_state=0).fit(X, y)
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, NTiles=4, SplitAxis='tree'))
+    model.write()
+    assert model.n_features == 128
 
 
 def test_tree_split_sums_the_per_tile_partial_scores(skl_model, tmp_path):

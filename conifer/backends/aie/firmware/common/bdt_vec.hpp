@@ -27,16 +27,4 @@ using acc_tag = std::conditional_t<std::is_floating_point_v<score_t>,
                                    accfloat, acc32>;
 using vacc = aie::accum<acc_tag, W>;
 
-__attribute__((always_inline))
-inline vmask is_false_node(feat_t thr, const vfeat &x) {
-    const vfeat t = aie::broadcast<feat_t, W>(thr);
-    return bdtm::SPLIT_LE ? aie::gt(x, t) : aie::ge(x, t);
-}
-
-// Which way a naive traversal branches: left iff SPLIT_LE ? x <= thr : x < thr.
-__attribute__((always_inline))
-inline vmask goes_left(const vfeat &x, const vfeat &thr) {
-    return bdtm::SPLIT_LE ? aie::le(x, thr) : aie::lt(x, thr);
-}
-
 }  // namespace bdtv

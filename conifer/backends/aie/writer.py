@@ -31,7 +31,7 @@ class AIEConfig(MultiPrecisionConfig):
     backend = 'aie'
     _config_fields = MultiPrecisionConfig._config_fields + [
         'priority', 'n_tiles', 'split_axis', 'vector_width', 'tau', 'n_samples',
-        'shard', 'feed', 'xilinx_part', 'platform', 'elfgen_jobs']
+        'shard', 'feed', 'plio_rate', 'xilinx_part', 'platform', 'elfgen_jobs']
     _aie_alts = {'priority': ['Priority'],
                  'n_tiles': ['NTiles'],
                  'split_axis': ['SplitAxis'],
@@ -40,6 +40,7 @@ class AIEConfig(MultiPrecisionConfig):
                  'n_samples': ['NSamples'],
                  'shard': ['Shard'],
                  'feed': ['Feed'],
+                 'plio_rate': ['PlioRate'],
                  'xilinx_part': ['XilinxPart'],
                  'platform': ['Platform'],
                  'elfgen_jobs': ['ElfgenJobs'],
@@ -55,6 +56,7 @@ class AIEConfig(MultiPrecisionConfig):
                      'n_samples': AUTO,
                      'shard': AUTO,
                      'feed': AUTO,
+                     'plio_rate': AUTO,
                      'xilinx_part': 'xcve2802-vsvh1760-2MP-e-S',
                      'platform': None,
                      'elfgen_jobs': None,
@@ -142,11 +144,17 @@ class AIEModel(ModelBase):
         if self.family != 'axis' or self.split_axis != 'tree' or self.n_tiles < 2:
             return
         mode = self.config.shard
+        # Sharding hands each tile a different row window, which only the memtile can
+        # deliver: a multicast PLIO gives every tile the same stream.
+        if self.config.feed == 'plio':
+            logger.info('feed=plio: not sharding, since only a memtile can hand each tile '
+                        'its own rows')
+            return
         self.sharding = _shard.Sharding(
             self.tables, self.n_trees_padded, self.n_features_padded, self.n_tiles,
             optimize='fast' if mode == 'fast' else 'search')
         self._verify_sharding()
-        self.feed_memtile = self.config.feed != 'plio'
+        self.feed_memtile = True
         self._notes.append(
             f'sharded: each tile reads {self.sharding.straggler_rows} of '
             f'{self.n_features_padded} feature rows at worst '
@@ -169,6 +177,20 @@ class AIEModel(ModelBase):
             raise RuntimeError(
                 f'the sharded tables disagree with the unsharded ones on {len(bad)} of '
                 f'{n_samples} samples; this is a backend bug, please report it')
+
+    def _resolve_plio_rate(self):
+        '''Offered PLIO rate in MHz'''
+        cfg, dev = self.config, self.device
+        if cfg.plio_rate == AUTO:
+            return dev.get('plio_rate_mhz', 625)
+        rate = float(cfg.plio_rate)
+        ceiling = dev.get('plio_rate_mhz_max')
+        if ceiling and rate > ceiling:
+            raise ValueError(f'plio_rate {rate} MHz exceeds the {ceiling} MHz this device '
+                             f'offers')
+        if rate <= 0:
+            raise ValueError(f'plio_rate must be positive, got {rate}')
+        return rate
 
     @property
     def feature_order(self):
@@ -221,6 +243,7 @@ class AIEModel(ModelBase):
 
         self.n_samples = (self._auto_n_samples() if cfg.n_samples == AUTO
                           else int(cfg.n_samples))
+        self.plio_rate = self._resolve_plio_rate()
         self._set_estimate()
 
     def _set_estimate(self):
@@ -243,11 +266,6 @@ class AIEModel(ModelBase):
         return step * int(math.ceil(DEFAULT_BATCH / step))
 
     def _check_shape(self):
-        f = self.n_features_padded
-        if not self.oblique and f > 64:
-            raise ValueError(
-                f'n_features {f} exceeds 64, which is where the kernel indexes its feature '
-                f'mask with a 64-bit shift')
         if self.n_samples % self.W:
             raise ValueError(f'n_samples {self.n_samples} must be a multiple of W {self.W}')
         if self.split_axis == 'sample' and (self.n_samples // self.W) % self.n_tiles:
@@ -262,8 +280,11 @@ class AIEModel(ModelBase):
                     f'the oblique kernel loads one 64-lane vector of terms per tree, so '
                     f'QS_NODES_PER_TREE * MAX_TERMS must be <= 64, got {p} * {terms}. '
                     f'Reduce max_depth to {int(math.log2(64 // terms + 1))} or fewer')
+            # The kernel's working word follows MAX_LEAVES (uint16 or uint32), not the
+            # generator's bv_t, which reaches uint64.
+            bvw_bits = 16 if self.tables.max_leaves <= 16 else 32
             qt_lanes = max(1 << (p - 1).bit_length(), 8)
-            if qt_lanes * self.tables.bv_bits > 1024:
+            if qt_lanes * bvw_bits > 1024:
                 raise ValueError(
                     f'the oblique kernel has no chunked node loop, which max_depth '
                     f'{self.tables.max_depth} would need')
@@ -289,6 +310,7 @@ class AIEModel(ModelBase):
                     'n_samples': self.n_samples,
                     'shard': self.sharding is not None,
                     'feed': 'memtile' if self.feed_memtile else 'plio',
+                    'plio_rate': self.plio_rate,
                     'xilinx_part': self.config.xilinx_part,
                     'platform': self.config.platform or self.device['platform'],
                     })
@@ -397,6 +419,7 @@ class AIEModel(ModelBase):
         s = ['// Generated by conifer. Do not edit.',
              '#pragma once', '#include <cstdint>', '']
         s.append(f'#define BDT_W {self.W}')
+        s.append(f'#define BDT_PLIO_RATE {self.plio_rate}')
         s.append(f'#define XIN_FILE "{cfg.output_dir}/data/x.dat"')
         if self.family == 'axis':
             s += [f'#define BDT_N_TILES {self.n_tiles}',
@@ -437,8 +460,6 @@ class AIEModel(ModelBase):
                   _array('unsigned', 'T_COUNT', sh.t_count),
                   _array('unsigned', 'N_FEAT', sh.n_feat),
                   _array('unsigned', 'OFFSET', sh.offset),
-                  _array('unsigned', 'MASK',
-                         [sum(1 << f for f in fs) for fs in sh.feats]),
                   '}  // namespace bdtsh', '', 'namespace bdtm {', '']
         s.append(_array('int16_t', 'QT_FEAT', qt_feat))
         s.append(_array(self.threshold_p.c_type, 'QT_THR', qt_thr))
@@ -623,6 +644,7 @@ def auto_config(granularity='simple'):
               'NSamples': AUTO,
               'Shard': AUTO,
               'Feed': AUTO,
+              'PlioRate': AUTO,
               'XilinxPart': 'xcve2802-vsvh1760-2MP-e-S',
               }
     return config

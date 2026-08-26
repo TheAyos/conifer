@@ -15,30 +15,16 @@ using namespace adf;
 #ifndef XIN_FILE
 #define XIN_FILE "../../gen/out/t32-d4-f16/int16/data/X_fm_w32_plio64.dat"
 #endif
-// Which sharding this build's per-tile cuts were made for. Written into xin_file.h
-// beside XIN_FILE, because the cut's NAME depends on it -- see shard_in_file below.
-#ifndef BDT_SHARD_KEY
-#define BDT_SHARD_KEY ""
-#endif
-
 namespace bdtmt {
 
 constexpr unsigned N_IN  = FEED_MEMTILE ? N_MEMTILE
                          : (SPLIT_TREE && !FEED_PLIO) ? 1u : N_TILES;
-constexpr unsigned N_OUT = (!SPLIT_TREE || MERGE_PLIO) ? N_TILES : 1u;  // chain has one tail
+constexpr unsigned N_OUT = N_TILES;  // every tile emits its own partial
 
 inline std::string tile_in_file(const std::string& base, unsigned t) {
     const std::string key = ".n" + std::to_string(N_TILES) + "d" + std::to_string(DELTA);
     const auto dot = base.rfind('.');
     const std::string tag = key + ".t" + std::to_string(t);
-    return dot == std::string::npos ? base + tag
-                                    : base.substr(0, dot) + tag + base.substr(dot);
-}
-
-inline std::string shard_in_file(const std::string& base, unsigned t) {
-    char tag[48];
-    std::snprintf(tag, sizeof tag, ".%s.m0x%04X", BDT_SHARD_KEY, feat_mask(t));
-    const auto dot = base.rfind('.');
     return dot == std::string::npos ? base + tag
                                     : base.substr(0, dot) + tag + base.substr(dot);
 }
@@ -50,19 +36,6 @@ private:
     kernel k[bdtmt::N_TILES];
 #if BDT_FEED_MEMTILE
     shared_buffer<bdtm::feat_t> mtx[bdtmt::N_MEMTILE];
-#endif
-#if BDT_MERGE_REDUCE
-    // The reducer tiles, numbered level by level so the root is always the last one.
-    kernel r[bdtmt::N_REDUCE];
-    static constexpr unsigned N_MERGE_INT =
-        bdtmt::N_REDUCE > 1 ? bdtmt::N_REDUCE - 1 : 1;
-    pktorderedmerge<bdtmt::REDUCE_K>   mg[N_MERGE_INT];
-    pktorderedmerge<bdtmt::ROOT_ARITY> mgr;
-#if BDT_TAP
-    // Tile 0's one output port carries two packet streams; this is what pulls them
-    // apart. Destination 0 is the tap and 1 is the merge, matching BDT_DEF_PKT_TAP.
-    pktsplit<2> sp0;
-#endif
 #endif
 
     // Every tile gets the same sizing and source; only its symbol differs.
@@ -83,9 +56,6 @@ private:
 public:
     input_plio  xin[bdtmt::N_IN];
     output_plio sout[bdtmt::N_OUT];
-#if BDT_TAP
-    output_plio tap;
-#endif
 
     theGraph() {
 #if BDT_SPLIT_TREE && BDT_N_TILES > 1
@@ -287,36 +257,12 @@ public:
 #endif
         for (unsigned i = 0; i < bdtmt::N_TILES; i++) configure(k[i]);
 
-#if BDT_MERGE_REDUCE
-#if BDT_REDUCE_NODES > 1
-        for (unsigned m = 0; m + 1 < bdtmt::N_REDUCE; m++) {
-#if BDT_REDUCE_K == 2
-            r[m] = kernel::create(bdt_qs_reduce_2);
-#elif BDT_REDUCE_K == 3
-            r[m] = kernel::create(bdt_qs_reduce_3);
-#else
-            r[m] = kernel::create(bdt_qs_reduce_4);
-#endif
-            configure(r[m]);
-        }
-#endif
-#if BDT_REDUCE_ROOT_K == 2
-        r[bdtmt::N_REDUCE - 1] = kernel::create(bdt_qs_reduce_root_2);
-#elif BDT_REDUCE_ROOT_K == 3
-        r[bdtmt::N_REDUCE - 1] = kernel::create(bdt_qs_reduce_root_3);
-#else
-        r[bdtmt::N_REDUCE - 1] = kernel::create(bdt_qs_reduce_root_4);
-#endif
-        configure(r[bdtmt::N_REDUCE - 1]);
-#endif
-
         for (unsigned i = 0; i < bdtmt::N_IN; i++) {
             const std::string name = "xin" + std::to_string(i);
             const std::string file =
-                  bdtmt::FEED_MEMTILE                            ? std::string(XIN_FILE)
-                : bdtmt::SHARDED                                 ? bdtmt::shard_in_file(XIN_FILE, i)
-                : (bdtmt::SPLIT_TREE || bdtmt::N_TILES == 1)     ? std::string(XIN_FILE)
-                                                                 : bdtmt::tile_in_file(XIN_FILE, i);
+                  (bdtmt::FEED_MEMTILE || bdtmt::SPLIT_TREE || bdtmt::N_TILES == 1)
+                      ? std::string(XIN_FILE)
+                      : bdtmt::tile_in_file(XIN_FILE, i);
             // The offered rate, matched to the mapping under a latency run and left at
             // the transport default otherwise -- see params.h.
             xin[i] = input_plio::create(name.c_str(), plio_64_bits, file.c_str(),
@@ -326,7 +272,8 @@ public:
             const std::string name = i == 0 ? "scores" : "scores" + std::to_string(i);
             const std::string file = i == 0 ? "scores.dat"
                                             : "scores.t" + std::to_string(i) + ".dat";
-            sout[i] = output_plio::create(name.c_str(), plio_32_bits, file.c_str(), 625);
+            sout[i] = output_plio::create(name.c_str(), plio_32_bits, file.c_str(),
+                                          bdtmt::PLIO_RATE);
         }
 
 #if BDT_FEED_MEMTILE
@@ -358,79 +305,8 @@ public:
         }
 #endif
 
-        if constexpr (!bdtmt::SPLIT_TREE || bdtmt::MERGE_PLIO) {
-            for (unsigned i = 0; i < bdtmt::N_TILES; i++)
-                connect<stream>(k[i].out[0], sout[i].in[0]);
-        }
-#if BDT_MERGE_REDUCE
-        else {
-            mgr = pktorderedmerge<bdtmt::ROOT_ARITY>::create();
-            for (unsigned m = 0; m + 1 < bdtmt::N_REDUCE; m++)
-                mg[m] = pktorderedmerge<bdtmt::REDUCE_K>::create();
-#if BDT_TAP
-            sp0 = pktsplit<2>::create();
-#endif
+        for (unsigned i = 0; i < bdtmt::N_TILES; i++)
+            connect<stream>(k[i].out[0], sout[i].in[0]);
 
-            for (unsigned j = 1; j <= bdtmt::REDUCE_LEVELS; j++) {
-                for (unsigned i = 0; i < bdtmt::reduce_count(j); i++) {
-                    const unsigned m       = bdtmt::reduce_offset(j) + i;
-                    const bool     is_root = (m + 1 == bdtmt::N_REDUCE);
-                    const unsigned arity   = is_root ? bdtmt::ROOT_ARITY : bdtmt::REDUCE_K;
-                    // Both merge types expose the same port vectors, so one reference
-                    // serves either and the wiring below is written once.
-                    auto& min  = is_root ? mgr.in     : mg[m].in;
-                    auto& mout = is_root ? mgr.out[0] : mg[m].out[0];
-
-                    for (unsigned c = 0; c < arity; c++) {
-                        const unsigned child = i * bdtmt::REDUCE_K + c;
-                        if (j == 1) {
-#if BDT_TAP
-                            // Tile 0's partial reaches the merge through the split that
-                            // also carries its tap. Destination 1, matching the kernel.
-                            if (child == 0) {
-                                connect(sp0.out[1], min[c]);
-                            } else {
-                                connect(k[child].out[0], min[c]);
-                            }
-#else
-                            connect(k[child].out[0], min[c]);
-#endif
-                        } else {
-                            connect(r[bdtmt::reduce_offset(j - 1) + child].out[0], min[c]);
-                        }
-                        // One packet per source per round. This is the ordered merge's
-                        // whole contract, so it is stated rather than defaulted.
-                        packet_count(min[c]) = 1;
-                    }
-                    connect(mout, r[m].in[0]);
-                }
-            }
-            connect<stream>(r[bdtmt::N_REDUCE - 1].out[0], sout[0].in[0]);
-#if BDT_TAP
-            connect(k[0].out[0], sp0.in[0]);
-            tap = output_plio::create("tap", plio_32_bits, "tap.dat", 625);
-            connect(sp0.out[0], tap.in[0]);
-#endif
-        }
-#else
-        else {
-            for (unsigned i = 0; i + 1 < bdtmt::N_TILES; i++)
-                connect<cascade>(k[i].out[0], k[i + 1].in[1]);
-            connect<stream>(k[bdtmt::N_TILES - 1].out[0], sout[0].in[0]);
-#if BDT_TAP
-            tap = output_plio::create("tap", plio_32_bits, "tap.dat", 625);
-            connect<stream>(k[0].out[1], tap.in[0]);
-#endif
-        }
-#endif
-
-        if constexpr (bdtmt::PLACE != 0) {
-            for (unsigned i = 0; i < bdtmt::N_TILES; i++)
-                location<kernel>(k[i]) = tile(bdtmt::place_col(i), bdtmt::place_row(i));
-            for (unsigned i = 0; i < bdtmt::N_IN; i++)
-                location<PLIO>(xin[i]) = shim(bdtmt::port_col(i));
-            for (unsigned i = 0; i < bdtmt::N_OUT; i++)
-                location<PLIO>(sout[i]) = shim(bdtmt::port_col(i));
-        }
     }
 };

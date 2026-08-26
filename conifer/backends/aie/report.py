@@ -146,16 +146,15 @@ def _build_metrics(sim_dir, meta, report):
         report['total_cyc'] = total
         report['throughput_ns_per_sample'] = float(total / ghz / n_samples)
 
-    # One tile, or sample-split: nothing is shared, so a group's residence is the
-    # invocation that scored it.
     per_call_ns = np.asarray([c['cyc'] / c['calls'] / ghz for c in cores if c['calls']])
-    if per_call_ns.size and (len(cores) == 1 or split_axis == 'sample'):
+    if not per_call_ns.size:
+        return
+    if len(cores) == 1 or split_axis == 'sample':
+        # Nothing is shared, so a group's residence is the invocation that scored it.
         report['latency_ss_ns'] = float(per_call_ns.mean())
         report['latency_ss_sd_ns'] = float(per_call_ns.std())
-    elif per_call_ns.size:
-        report['latency_ss_ns'] = float(per_call_ns.max())
-        report['latency_ss_note'] = ('approximated by the straggler invocation: a tree-split '
-                                     'graph does not expose the head tile acceptance')
+    else:
+        _tree_split_latency(sim_dir, cores, per_call_ns, meta, report)
 
     tp = os.path.join(os.path.dirname(sim_dir), 'throughput_info.json')
     if os.path.exists(tp):
@@ -164,6 +163,54 @@ def _build_metrics(sim_dir, meta, report):
         report['port_throughput_mbps'] = {
             v.get('port name'): float(str(v.get('Throughput', '0')).split()[0])
             for v in ports.values()}
+
+
+def _tree_split_latency(sim_dir, cores, per_call_ns, meta, report):
+    """Residence of a group across the array, from the per-tile output timestamps
+
+    Every tile emits its own partial, so the first word a group needs and the last it
+    produces are both observable: no tap port is required.
+    """
+    n = len(cores)
+    W = meta.get('config', {}).get('vector_width') or meta.get('n_samples')
+    files = [os.path.join(sim_dir, 'scores.dat' if i == 0 else f'scores.t{i}.dat')
+             for i in range(n)]
+    if not (W and all(os.path.isfile(f) for f in files)):
+        report['latency_ss_ns'] = float(per_call_ns.max())
+        report['latency_ss_note'] = 'approximated by the straggler invocation'
+        return
+
+    order = _tile_order(cores, n)
+    if order is None:
+        report['latency_ss_ns'] = float(per_call_ns.max())
+        report['latency_ss_note'] = 'approximated: cores could not be matched to ports'
+        return
+    per_call_ns = per_call_ns[order]
+
+    lasts = [read_plio(f)[0][W - 1::W] for f in files]
+    g = min(len(t) for t in lasts)
+    if g < 1:
+        report['latency_ss_ns'] = float(per_call_ns.max())
+        report['latency_ss_note'] = 'approximated: too few groups to time'
+        return
+    out = np.asarray([t[:g] for t in lasts])
+    lat = out.max(axis=0) - (out - per_call_ns[:, None]).min(axis=0)
+    report['latency_ss_ns'] = float(lat.mean())
+    report['latency_ss_sd_ns'] = float(lat.std())
+    if lat.std() > 0.10 * lat.mean():
+        report['latency_ss_note'] = (f'scatters {lat.std():.0f} ns about a '
+                                     f'{lat.mean():.0f} ns mean')
+
+
+def _tile_order(cores, n):
+    """Cores come back in placement order; the output ports are in tile order"""
+    idx = []
+    for c in cores:
+        m = re.search(r'_tile_(\d+)$', c['name'])
+        if not m:
+            return None
+        idx.append(int(m.group(1)))
+    return np.argsort(idx) if sorted(idx) == list(range(n)) else None
 
 
 def read_aie_report(output_dir) -> dict:

@@ -41,8 +41,8 @@ public:
         heap_size(k1)  = HEAP;
         stack_size(k1) = STACK;
 
-        xin  = input_plio ::create("xin",    plio_64_bits, XIN_FILE,     625);
-        sout = output_plio::create("scores", plio_32_bits, "scores.dat", 625);
+        xin  = input_plio ::create("xin",    plio_64_bits, XIN_FILE,     BDT_PLIO_RATE);
+        sout = output_plio::create("scores", plio_32_bits, "scores.dat", BDT_PLIO_RATE);
 
         connect<stream> net_in (xin.out[0], k1.in[0]);
         connect<stream> net_out(k1.out[0],  sout.in[0]);
