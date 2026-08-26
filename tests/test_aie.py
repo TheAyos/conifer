@@ -414,3 +414,16 @@ def test_cost_model_tracks_the_measured_width_sweep(depth, W, measured):
     '''One tree per tile, 16 features, int16 - the shape the widths were swept at'''
     got = mapper.invocation_cycles(16, depth, 1, W, 2)
     assert abs(got - measured) / measured < 0.10
+
+
+def test_an_unswept_width_says_so(skl_model, tmp_path):
+    '''W=8 at depth 4 is priced by mechanism, not measured; the estimate must admit it'''
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path, VectorWidth=8))
+    assert any('not swept' in v for v in model.estimate['validity'])
+
+
+def test_a_swept_width_carries_no_caveat(skl_model, tmp_path):
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path, VectorWidth=32))
+    assert not any('not swept' in v for v in model.estimate['validity'])

@@ -17,6 +17,10 @@ _DEPTH_COST = {2: (107, 50.5),
 # Depths whose per_tree is extrapolated rather than fitted.
 _EXTRAPOLATED_DEPTHS = ()
 
+# The (depth, W) points the width sweep actually covered. Anything else is priced by the
+# mechanism rather than measured, and says so.
+_MEASURED_WIDTHS = {4: (16, 32), 5: (16, 32), 6: (8, 16, 32)}
+
 # Measured: W=32 wins throughput at every depth, W=16 wins latency at every depth. The
 # invocation is what latency pays and W is what throughput divides by, so they pull apart.
 _PRIORITY_W = {'latency': 16, 'throughput': 32}
@@ -209,8 +213,13 @@ def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
     if max_depth in _EXTRAPOLATED_DEPTHS:
         validity.append(f'per_tree at depth {max_depth} is extrapolated from the bitvector '
                         'step, not fitted')
-    if W != 32:
-        validity.append(f'the cost law was fitted at W=32; W={W} scales it by register count')
+    if W not in _MEASURED_WIDTHS.get(max_depth, ()):
+        measured = _MEASURED_WIDTHS.get(max_depth)
+        validity.append(
+            f'W={W} was not swept at depth {max_depth}'
+            + (f' (measured: {", ".join(str(w) for w in measured)})' if measured else '')
+            + '; the cost is modelled from the register counts, and has read ~18% '
+              'optimistic on cycles at the narrowest widths')
     if feat_bytes != 2:
         validity.append('the cost law was fitted at int16')
     if oblique:
