@@ -12,6 +12,7 @@ from conifer.backends.aie import checks, mapper, shard as _shard, tables as _tab
 from conifer.backends.aie.precision import Precision, COMPARE_WIDTH, SCORE_WIDTH
 from conifer.backends.aie.devices import get_device_config
 from conifer.backends.aie.report import read_aie_report
+from conifer.backends.aie.platforms import find_platform, resolve_platform
 from conifer.backends.aie import tools
 import logging
 logger = logging.getLogger(__name__)
@@ -74,6 +75,12 @@ class AIEConfig(MultiPrecisionConfig):
         if self.priority not in ('latency', 'throughput'):
             raise ValueError(f"priority must be 'latency' or 'throughput', got "
                              f"'{self.priority}'")
+        if self.shard not in (AUTO, 'fast', True, False, 'false', 'off'):
+            raise ValueError(f"shard must be '{AUTO}', 'fast' or False, got "
+                             f"'{self.shard}'")
+        if self.feed not in (AUTO, 'memtile', 'plio'):
+            raise ValueError(f"feed must be 'memtile', 'plio' or '{AUTO}', got "
+                             f"'{self.feed}'")
         if self.split_axis not in (AUTO, 'tree', 'sample'):
             raise ValueError(f"split_axis must be 'tree', 'sample' or '{AUTO}', got "
                              f"'{self.split_axis}'")
@@ -130,8 +137,10 @@ class AIEModel(ModelBase):
             return
         if self.family != 'axis' or self.split_axis != 'tree' or self.n_tiles < 2:
             return
-        self.sharding = _shard.Sharding(self.tables, self.n_trees_padded,
-                                        self.n_features_padded, self.n_tiles)
+        mode = self.config.shard
+        self.sharding = _shard.Sharding(
+            self.tables, self.n_trees_padded, self.n_features_padded, self.n_tiles,
+            optimize='fast' if mode == 'fast' else 'search')
         self._verify_sharding()
         self.feed_memtile = self.config.feed != 'plio'
         self._notes.append(
@@ -310,7 +319,10 @@ class AIEModel(ModelBase):
         cfg = self.config
         template = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'template',
                                 'Makefile')
-        platform = cfg.platform or self.device['platform']
+        # Resolve now if the toolchain is here, so the Makefile carries a real path;
+        # otherwise leave the name for make to resolve when it is.
+        name = cfg.platform or self.device['platform']
+        platform = find_platform(name) or name
         subs = {'@PLATFORM@': platform,
                 '@TOP@': '../src/tb.cpp',
                 '@ELFGEN_JOBS@': '' if cfg.elfgen_jobs is None else str(cfg.elfgen_jobs),
@@ -438,10 +450,15 @@ class AIEModel(ModelBase):
         s += ['}  // namespace bdtm', '']
         return '\n'.join(s)
 
+    def platform(self):
+        '''Absolute path of the .xpfm this project builds against'''
+        return resolve_platform(self.config.platform or self.device['platform'])
+
     @copydocstring(ModelBase.compile)
     def compile(self):
         self.write()
-        return tools.run_make(self.config.output_dir, 'x86sim_build')
+        return tools.run_make(self.config.output_dir, 'x86sim_build',
+                              PLATFORM=self.platform())
 
     @copydocstring(ModelBase.decision_function)
     def decision_function(self, X, trees=False):
@@ -453,7 +470,7 @@ class AIEModel(ModelBase):
             f'Wrong number of features, expected {self.n_features}, got {X.shape[1]}'
         n = len(X)
         self.write_input(X)
-        if not tools.run_make(self.config.output_dir, 'x86sim'):
+        if not tools.run_make(self.config.output_dir, 'x86sim', PLATFORM=self.platform()):
             return None
         y = self.read_scores()
         return y[:n]
@@ -488,8 +505,8 @@ class AIEModel(ModelBase):
         return self.n_tiles if self.family == 'axis' else 1
 
     def _score_dir(self):
-        for d in ('build_x86/x86simulator_output/data', 'build_hw/aiesimulator_output',
-                  'x86simulator_output/data', 'data'):
+        for d in ('build_x86/x86simulator_output', 'build_hw/aiesimulator_output',
+                  'x86simulator_output', 'data'):
             p = f'{self.config.output_dir}/{d}'
             if os.path.exists(f'{p}/scores.dat'):
                 return p
@@ -534,7 +551,7 @@ class AIEModel(ModelBase):
         self.write()
         start = datetime.datetime.now()
         logger.info(f'build starting {start:%H:%M:%S}')
-        ok = tools.run_make(self.config.output_dir, 'aiesim')
+        ok = tools.run_make(self.config.output_dir, 'aiesim', PLATFORM=self.platform())
         stop = datetime.datetime.now()
         logger.info(f'build finished {stop:%H:%M:%S} - took {str(stop - start)}')
         return ok

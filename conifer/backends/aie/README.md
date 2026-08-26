@@ -5,6 +5,11 @@ kernel mapped across one or more AIE tiles.
 
 Target: VEK280 (`xcve2802`), AIE-ML.
 
+Platforms are located from the Vitis environment, so sourcing `settings64.sh` is
+enough - `PLATFORM_REPO_PATHS` does not have to be set. Both the `vek280_base` and
+`xilinx_vek280_base_<version>` layouts are recognised. Set `Platform` to an `.xpfm`
+path to override.
+
 ## Quick start
 
 ```python
@@ -48,7 +53,7 @@ in; passing that back reproduces the same project.
 | `VectorWidth` | `auto` | samples per invocation |
 | `Tau` | `auto` | trees per tile under tree-split |
 | `NSamples` | `auto` | rows the graph is compiled for |
-| `Shard` | `auto` | cut each tile's feature rows to a contiguous window (tree-split only) |
+| `Shard` | `auto` | `auto` searches the layout, `fast` skips the search, `False` disables sharding |
 | `Feed` | `auto` | `memtile` shares one input across the array; `plio` gives each tile a port |
 | `XilinxPart` | `xcve2802-vsvh1760-2MP-e-S` | selects the device record |
 | `ElfgenJobs` | unset | caps `aiecompiler` ELF generation fan-out |
@@ -75,6 +80,10 @@ count and balance at every tile count.
 
 Sample-split is never sharded - a sample-split tile holds the whole ensemble, so it
 reads every row. Set `Shard=False` or `Feed='plio'` to decline either.
+
+The tree assignment and the feature order are searched together, seeded so a build is
+reproducible; `Shard='fast'` takes a deterministic heuristic instead, at a few percent
+more rows.
 
 Every sharded model is checked before it is emitted: the per-tile partial scores are
 replayed and required to sum to exactly what the unsharded tables score.

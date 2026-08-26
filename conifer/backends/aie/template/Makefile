@@ -5,9 +5,10 @@
 #   make aiesim         compile for hardware and run the cycle-accurate simulator
 #   make clean
 #
-# Needs the Vitis AI Engine tools on PATH and PLATFORM_REPO_PATHS set.
+# Needs the Vitis AI Engine tools on PATH. PLATFORM is filled in by conifer when the
+# toolchain is present at write time; override it to build elsewhere.
 
-PLATFORM ?= $(PLATFORM_REPO_PATHS)/@PLATFORM@/@PLATFORM@.xpfm
+PLATFORM ?= @PLATFORM@
 TOP       = @TOP@
 XLOPT    ?= 1
 
@@ -26,18 +27,24 @@ AIE_FLAGS = --xlopt=$(XLOPT) \
             -include="../" -include="../src" \
             -platform=$(PLATFORM) -workdir=./Work
 
-.PHONY: x86sim_build x86sim aiesim clean
+.PHONY: x86sim_build x86sim aiesim clean check-platform
+
+check-platform:
+	@test -f "$(PLATFORM)" || { \
+	  echo "ERROR: no platform at '$(PLATFORM)'."; \
+	  echo "  Source the Vitis settings64.sh, or pass PLATFORM=/path/to/x.xpfm"; \
+	  exit 1; }
 
 # aiecompiler runs from a subdirectory: the graph names its kernel sources as
 # "src/<file>.cpp", resolved against the parent of the working directory.
-x86sim_build:
+x86sim_build: check-platform
 	mkdir -p $(SWDIR) && cd $(SWDIR) && \
 	aiecompiler $(AIE_FLAGS) -target=x86sim $(TOP)
 
 x86sim: x86sim_build
 	cd $(SWDIR) && x86simulator --pkg-dir=./Work -i=.. --dump
 
-aiesim:
+aiesim: check-platform
 	mkdir -p $(HWDIR) && cd $(HWDIR) && \
 	aiecompiler $(AIE_FLAGS) -target=hw $(TOP) && \
 	aiesimulator --pkg-dir=./Work -i.. --profile

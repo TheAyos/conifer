@@ -45,13 +45,14 @@ def require_tools(*tools):
             f'PLATFORM_REPO_PATHS to a platform repository')
 
 
-def run_make(output_dir, target):
+def run_make(output_dir, target, **variables):
     '''Run one target of the project Makefile'''
     tools = {'x86sim_build': ('aiecompiler',),
              'x86sim': ('aiecompiler', 'x86simulator'),
              'aiesim': ('aiecompiler', 'aiesimulator')}.get(target, ())
     require_tools(*tools)
-    cmd = f'make -C {output_dir} {target}'
+    args = ' '.join(f"{k}='{v}'" for k, v in variables.items() if v is not None)
+    cmd = f'make -C {output_dir} {target} {args}'.strip()
     logger.debug(f'Running build with command "{cmd}"')
     success = os.system(cmd)
     if success > 0:

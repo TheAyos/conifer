@@ -1,3 +1,4 @@
+import random
 import numpy as np
 import logging
 logger = logging.getLogger(__name__)
@@ -54,6 +55,50 @@ def _cost(groups, tree_feats, fperm):
     return (max(w), sum(w))
 
 
+def search_span(tree_feats, n_trees, n_features, n_shards, seed=0, restarts=6,
+                iters=None):
+    """Assign trees and permute features together, minimising the window
+
+    A memtile hands a tile a contiguous range of rows, so the only way to make a shard's
+    rows contiguous is to choose the order they are written in. Seeded, so a build is
+    reproducible.
+    """
+    # Scaled to the neighbourhood: a small model converges long before 120k moves.
+    if iters is None:
+        iters = min(120_000, max(6_000, 400 * (n_trees + n_features * n_shards)))
+    rng = random.Random(seed)
+    tau = n_trees // n_shards
+    best = None
+    for _ in range(restarts):
+        order = list(range(n_trees))
+        rng.shuffle(order)
+        g = [order[s * tau:(s + 1) * tau] for s in range(n_shards)]
+        fperm = list(range(n_features))
+        rng.shuffle(fperm)
+        cur = _cost(g, tree_feats, fperm)
+        for _ in range(iters // restarts):
+            if n_shards >= 2 and rng.random() < 0.5:
+                a, b = rng.sample(range(n_shards), 2)
+                i, j = rng.randrange(len(g[a])), rng.randrange(len(g[b]))
+                g[a][i], g[b][j] = g[b][j], g[a][i]
+                new = _cost(g, tree_feats, fperm)
+                if new <= cur:
+                    cur = new
+                else:
+                    g[a][i], g[b][j] = g[b][j], g[a][i]
+            else:
+                u, v = rng.sample(range(n_features), 2)
+                fperm[u], fperm[v] = fperm[v], fperm[u]
+                new = _cost(g, tree_feats, fperm)
+                if new <= cur:
+                    cur = new
+                else:
+                    fperm[u], fperm[v] = fperm[v], fperm[u]
+        if best is None or cur < best[0]:
+            best = (cur, [sorted(x) for x in g], list(fperm))
+    return best[1], best[2]
+
+
 def refine(groups, fperm, tree_feats, n_features, rounds=6):
     '''Descend on the straggler window by swapping trees, then feature positions
 
@@ -96,7 +141,7 @@ class Sharding:
     '''
 
     def __init__(self, tables, n_trees, n_features, n_shards, groups=None, fperm=None,
-                 optimize=True):
+                 optimize='search', seed=0):
         self.tables = tables
         self.n_trees = n_trees
         self.n_features = n_features
@@ -104,14 +149,19 @@ class Sharding:
         self.nodes_per_tree = tables.nodes_per_tree
 
         self.tree_feats = tree_feature_sets(tables, n_trees, self.nodes_per_tree)
-        self.groups = groups or assign_contiguous(n_trees, n_shards)
+        chosen = groups is None and fperm is None and n_shards > 1
+        if chosen and optimize == 'search':
+            self.groups, self.fperm = search_span(self.tree_feats, n_trees, n_features,
+                                                  n_shards, seed=seed)
+        else:
+            self.groups = groups or assign_contiguous(n_trees, n_shards)
+            self.fperm = list(fperm) if fperm else feature_permutation(
+                self.groups, self.tree_feats, n_features)
+            if chosen and optimize:
+                self.groups, self.fperm = refine(self.groups, self.fperm,
+                                                 self.tree_feats, n_features)
         if sorted(h for g in self.groups for h in g) != list(range(n_trees)):
             raise ValueError('the tree assignment is not a partition of the ensemble')
-        self.fperm = list(fperm) if fperm else feature_permutation(
-            self.groups, self.tree_feats, n_features)
-        if optimize and groups is None and fperm is None and n_shards > 1:
-            self.groups, self.fperm = refine(self.groups, self.fperm, self.tree_feats,
-                                             n_features)
         if sorted(self.fperm) != list(range(n_features)):
             raise ValueError('the feature permutation is not a permutation')
 

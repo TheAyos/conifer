@@ -190,7 +190,7 @@ def read_aie_report(output_dir) -> dict:
             break
 
     sim_dir = os.path.join(output_dir, 'build_hw', 'aiesimulator_output')
-    if os.path.isdir(sim_dir):
+    if os.path.isdir(sim_dir) and glob.glob(os.path.join(sim_dir, 'profile_funct_*.xml')):
         report['stage'] = 'build'
         _build_metrics(sim_dir, meta, report)
 

@@ -300,3 +300,53 @@ def test_tree_split_sums_the_per_tile_partial_scores(skl_model, tmp_path):
                 f.write(f'T 100 ns\n{int(v)}\n')
     got = model.read_scores()
     np.testing.assert_allclose(got, model.score_p.dequantize(np.sum(parts, axis=0)))
+
+
+# ----- platform discovery -----
+
+def test_platform_is_found_from_the_vitis_environment(tmp_path, monkeypatch):
+    '''settings64.sh sets XILINX_VITIS but not PLATFORM_REPO_PATHS'''
+    from conifer.backends.aie import platforms
+    root = tmp_path / 'Vitis'
+    d = root / 'base_platforms' / 'xilinx_vek280_base_202610_1'
+    os.makedirs(d)
+    open(d / 'xilinx_vek280_base_202610_1.xpfm', 'w').close()
+    monkeypatch.setenv('XILINX_VITIS', str(root))
+    monkeypatch.delenv('PLATFORM_REPO_PATHS', raising=False)
+    assert platforms.find_platform('vek280_base') == str(
+        d / 'xilinx_vek280_base_202610_1.xpfm')
+
+
+def test_platform_prefers_the_exactly_named_directory(tmp_path, monkeypatch):
+    from conifer.backends.aie import platforms
+    base = tmp_path / 'Vitis' / 'base_platforms'
+    for name in ('vek280_base', 'xilinx_vek280_base_202610_1'):
+        os.makedirs(base / name)
+        open(base / name / f'{name}.xpfm', 'w').close()
+    monkeypatch.setenv('XILINX_VITIS', str(tmp_path / 'Vitis'))
+    monkeypatch.delenv('PLATFORM_REPO_PATHS', raising=False)
+    assert platforms.find_platform('vek280_base').endswith('vek280_base/vek280_base.xpfm')
+
+
+def test_missing_platform_says_where_it_looked(monkeypatch):
+    from conifer.backends.aie import platforms
+    monkeypatch.delenv('PLATFORM_REPO_PATHS', raising=False)
+    monkeypatch.delenv('XILINX_VITIS', raising=False)
+    monkeypatch.delenv('XILINX_HLS', raising=False)
+    with pytest.raises(RuntimeError, match='settings64|PLATFORM_REPO_PATHS'):
+        platforms.resolve_platform('vek280_base')
+
+
+def test_scores_are_read_from_the_simulator_output_directory(skl_model, tmp_path):
+    '''x86simulator writes into <build>/x86simulator_output, not a data/ below it'''
+    model = _sharded(skl_model, tmp_path, n_tiles=2)
+    model.write()
+    d = tmp_path / 'build_x86' / 'x86simulator_output'
+    os.makedirs(d)
+    for i in range(2):
+        name = 'scores.dat' if i == 0 else f'scores.t{i}.dat'
+        with open(d / name, 'w') as f:
+            for v in range(model.n_samples):
+                f.write(f'{v * (i + 1)}\n')
+    got = model.read_scores()
+    assert len(got) == model.n_samples
