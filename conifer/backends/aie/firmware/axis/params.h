@@ -45,10 +45,6 @@
 #define BDT_PLIO_RATE 625
 #endif
 
-#ifndef BDT_T_BEGIN
-#define BDT_T_BEGIN 0
-#endif
-
 #ifndef BDT_TAU
 #define BDT_TAU 0        /* 0 = derive from N_TILES */
 #endif
@@ -111,16 +107,13 @@ static_assert(bdtsh::N_SHARDS == N_SHARDS,
 static_assert(SPLIT_TREE || N_TILES == 1,
               "sharding is a property of the TREE axis; a sample-split tile holds the "
               "whole ensemble and therefore reads every feature");
-static_assert(BDT_T_BEGIN == 0,
-              "a sharded model starts each tile where its own table says, not at an "
-              "offset -- BDT_T_BEGIN is for the unsharded single-tile gate");
 #endif
 
 constexpr unsigned t_begin(unsigned shard) {
 #if BDT_SHARDED
     return bdtsh::T_BEGIN[shard];
 #else
-    return BDT_T_BEGIN + shard * TAU;
+    return shard * TAU;
 #endif
 }
 constexpr unsigned t_count(unsigned shard) {

@@ -150,9 +150,10 @@ def _build_metrics(sim_dir, meta, report):
     if not per_call_ns.size:
         return
     if len(cores) == 1 or split_axis == 'sample':
-        # Nothing is shared, so a group's residence is the invocation that scored it.
+        # A group lives on one tile, so its residence is that tile's own invocation.
         report['latency_ss_ns'] = float(per_call_ns.mean())
         report['latency_ss_sd_ns'] = float(per_call_ns.std())
+        report['latency_ss_drift_ns_per_group'] = 0.0
     else:
         _tree_split_latency(sim_dir, cores, per_call_ns, meta, report)
 
@@ -163,6 +164,51 @@ def _build_metrics(sim_dir, meta, report):
         report['port_throughput_mbps'] = {
             v.get('port name'): float(str(v.get('Throughput', '0')).split()[0])
             for v in ports.values()}
+
+
+MIN_STEADY_GROUPS = 4
+
+
+def _slope_per_group(values):
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mx = (n - 1) / 2.0
+    my = float(np.mean(values))
+    denom = sum((i - mx) ** 2 for i in range(n))
+    if not denom:
+        return 0.0
+    return sum((i - mx) * (v - my) for i, v in enumerate(values)) / denom
+
+
+def _summarise_latency(lat, report, offset=0, note=''):
+    """Residence as a fit, not a mean
+
+    A pipelined mapping can hold a steady period while residence climbs, so the mean is
+    a function of the run length. The intercept - a group entering with no accumulated
+    skew - is not, and the slope is reported beside it.
+    """
+    lat = list(lat)
+    if len(lat) < MIN_STEADY_GROUPS:
+        report['latency_ss_note'] = (f'unmeasured: {len(lat)} steady-state groups, under '
+                                     f'the {MIN_STEADY_GROUPS} required')
+        return
+    # The intercept is referenced to the FIRST group of the run, not to the first
+    # surviving the trim, or a trimmed window would report its own accumulated skew.
+    drift = _slope_per_group(lat)
+    mid = offset + (len(lat) - 1) / 2.0
+    intercept = float(np.mean(lat)) - drift * mid
+    resid = [v - (intercept + drift * (offset + i)) for i, v in enumerate(lat)]
+    sd = float(np.std(resid))
+    report['latency_ss_ns'] = intercept
+    report['latency_ss_sd_ns'] = sd
+    report['latency_ss_drift_ns_per_group'] = drift
+    if sd > 0.10 * intercept:
+        note = (note + '; ' if note else '') + (
+            f'latency_ss scatters {sd:.0f} ns about its fit, '
+            f'{100 * sd / intercept:.0f}% of the intercept - not a line plus noise')
+    if note:
+        report['latency_ss_note'] = note
 
 
 def _tree_split_latency(sim_dir, cores, per_call_ns, meta, report):
@@ -195,11 +241,11 @@ def _tree_split_latency(sim_dir, cores, per_call_ns, meta, report):
         return
     out = np.asarray([t[:g] for t in lasts])
     lat = out.max(axis=0) - (out - per_call_ns[:, None]).min(axis=0)
-    report['latency_ss_ns'] = float(lat.mean())
-    report['latency_ss_sd_ns'] = float(lat.std())
-    if lat.std() > 0.10 * lat.mean():
-        report['latency_ss_note'] = (f'scatters {lat.std():.0f} ns about a '
-                                     f'{lat.mean():.0f} ns mean')
+    # Drop the groups that fill the array and the ones that drain it - a small slice,
+    # since a PLIO merge has no chain to fill.
+    skip = min(len(lat) // 8, max(0, (len(lat) - MIN_STEADY_GROUPS) // 2))
+    trimmed = lat[skip:len(lat) - skip] if skip else lat
+    _summarise_latency(trimmed, report, offset=skip)
 
 
 def _tile_order(cores, n):

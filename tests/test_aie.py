@@ -452,3 +452,48 @@ def test_a_swept_width_carries_no_caveat(skl_model, tmp_path):
     clf, _ = skl_model
     model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path, VectorWidth=32))
     assert not any('not swept' in v for v in model.estimate['validity'])
+
+
+# ----- latency_ss is a fit, not a mean -----
+
+def _drifting(n_groups, base=300.0, drift=6.0):
+    return [base + drift * i for i in range(n_groups)]
+
+
+def test_latency_intercept_does_not_move_with_run_length():
+    """A pipelined mapping drifts, so the mean is a function of how long the run was"""
+    from conifer.backends.aie.report import _summarise_latency
+    got = []
+    for n in (8, 16, 32, 64):
+        r = {}
+        _summarise_latency(_drifting(n), r)
+        got.append(r['latency_ss_ns'])
+    assert max(got) - min(got) < 1e-6, f'intercept moved with run length: {got}'
+    means = [np.mean(_drifting(n)) for n in (8, 16, 32, 64)]
+    assert max(means) - min(means) > 100, 'the mean should move, or this proves nothing'
+
+
+def test_latency_reports_the_drift_beside_the_intercept():
+    from conifer.backends.aie.report import _summarise_latency
+    r = {}
+    _summarise_latency(_drifting(32, base=300.0, drift=6.4), r)
+    assert r['latency_ss_ns'] == pytest.approx(300.0)
+    assert r['latency_ss_drift_ns_per_group'] == pytest.approx(6.4)
+
+
+def test_a_trimmed_window_still_reports_group_zero():
+    """Trimming the fill must not report the window's own accumulated skew"""
+    from conifer.backends.aie.report import _summarise_latency
+    full, trimmed = {}, {}
+    lat = _drifting(32)
+    _summarise_latency(lat, full)
+    _summarise_latency(lat[4:28], trimmed, offset=4)
+    assert trimmed['latency_ss_ns'] == pytest.approx(full['latency_ss_ns'])
+
+
+def test_too_few_groups_is_declined_not_guessed():
+    from conifer.backends.aie.report import _summarise_latency
+    r = {}
+    _summarise_latency([300.0, 306.0], r)
+    assert 'latency_ss_ns' not in r
+    assert 'unmeasured' in r['latency_ss_note']

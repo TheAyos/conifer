@@ -184,10 +184,11 @@ class AIEModel(ModelBase):
         if cfg.plio_rate == AUTO:
             return dev.get('plio_rate_mhz', 625)
         rate = float(cfg.plio_rate)
-        ceiling = dev.get('plio_rate_mhz_max')
-        if ceiling and rate > ceiling:
-            raise ValueError(f'plio_rate {rate} MHz exceeds the {ceiling} MHz this device '
-                             f'offers')
+        # A PLIO runs at most half the AI Engine array clock.
+        ceiling = 1000.0 * dev['clock_ghz'] / 2
+        if rate > ceiling:
+            raise ValueError(f'plio_rate {rate} MHz exceeds {ceiling:g} MHz, half the '
+                             f'{dev["clock_ghz"]} GHz array clock')
         if rate <= 0:
             raise ValueError(f'plio_rate must be positive, got {rate}')
         return rate

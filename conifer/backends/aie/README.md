@@ -51,6 +51,7 @@ in; passing that back reproduces the same project.
 | `NTiles` | `auto` | 1–64 |
 | `SplitAxis` | `auto` | `tree` or `sample` |
 | `VectorWidth` | `auto` | samples per invocation; auto chooses from 8, 16, 32 |
+| `PlioRate` | `auto` | offered input rate in MHz; at most half the array clock |
 | `Tau` | `auto` | trees per tile under tree-split |
 | `NSamples` | `auto` | rows the graph is compiled to score in one run |
 | `Shard` | `auto` | `auto` searches the layout, `fast` skips the search, `False` disables sharding |
@@ -135,6 +136,21 @@ per-invocation setup is comparable to the per-tree work, so neither can be picke
 
 Auto only chooses vector widths the study measured. Wider ones build and the cost model
 prices them, but set `VectorWidth` explicitly to use one.
+
+## What `latency_ss` means
+
+The residence of one group: from the array accepting its first input word to its last
+score existing. Under tree-split every tile holds the same group, so the array first
+held it when the earliest tile accepted it and the answer exists when the last partial
+does. Acceptance is reconstructed from each tile's own output, since an invocation
+begins by reading: `accepted = emitted - invocation`.
+
+It is reported as the **intercept of a fit** over group index, not a mean, with the
+slope beside it as `latency_ss_drift_ns_per_group`. A pipelined mapping can hold a
+perfectly steady period while residence climbs, in which case the mean is a function of
+how long the run was and the intercept is not.
+
+This is the steady-state residence, not the cold latency of a drained graph.
 
 ## The estimate
 
