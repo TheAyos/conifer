@@ -93,3 +93,30 @@ def test_compile_reports_real_tile_memory(tmp_path):
     report = model.read_report()
     assert report['stage'] == 'compile'
     assert report['tile_memory_bytes_max'] > 0
+
+
+@pytest.mark.parametrize('n_rows', [1, 33, 64, 150])
+def test_x86sim_returns_every_row_bit_exactly(tmp_path, n_rows):
+    """One score per row, each equal to the cpp backend's, whatever the batch size"""
+    from sklearn.datasets import make_classification
+    from sklearn.ensemble import GradientBoostingClassifier
+    X, y = make_classification(n_samples=900, n_features=16, n_informative=8,
+                               random_state=0)
+    clf = GradientBoostingClassifier(n_estimators=16, max_depth=4,
+                                     random_state=0).fit(X[:700], y[:700])
+    precisions = {'Precision': COMPARE, 'InputPrecision': COMPARE,
+                  'ThresholdPrecision': COMPARE, 'WeightPrecision': COMPARE,
+                  'ScorePrecision': SCORE}
+
+    model = conifer.converters.convert_from_sklearn(
+        clf, _aie_config(tmp_path / 'aie', NSamples=64, NTiles=2, SplitAxis='tree',
+                         **precisions))
+    assert model.compile()
+
+    Xt = X[700:700 + n_rows]
+    y_aie = model.decision_function(Xt)
+    ref = _cpp_reference(model, tmp_path / f'cpp{n_rows}', precisions)
+    y_ref = np.asarray(ref.decision_function(Xt)).ravel()
+
+    assert len(y_aie) == n_rows, f'asked for {n_rows} scores, got {len(y_aie)}'
+    np.testing.assert_allclose(y_aie, y_ref, atol=0, rtol=0)

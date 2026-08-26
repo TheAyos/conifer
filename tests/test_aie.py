@@ -537,3 +537,76 @@ def test_an_oversized_batch_is_refused_by_write_input(skl_model, tmp_path):
     model.write()
     with pytest.raises(ValueError, match='exceeds'):
         model.write_input(np.zeros((model.n_samples + 1, model.n_features)))
+
+
+# ----- decision_function must return one score per row, whatever the batch -----
+
+def _stub_simulator(model, monkeypatch):
+    """Stand in for x86simulator: score whatever write_input last wrote.
+
+    Exercises the real path - write_input, the per-tile merge, read_scores and the
+    chunking - without a toolchain, which is where the truncation bug lived.
+    """
+    from conifer.backends.aie import tools
+    state = {}
+    real_write = model.write_input
+
+    def write_input(X):
+        state['X'] = np.asarray(X, dtype=np.float64)
+        real_write(X)
+
+    def run_make(output_dir, target, **kwargs):
+        X = state['X']
+        if len(X) < model.n_samples:
+            X = np.vstack([X, np.zeros((model.n_samples - len(X), X.shape[1]))])
+        q = model.tables.replay(X, model.threshold_p, model.score_p,
+                                model.init_predict[0], norm=model.norm,
+                                split_le=(model.splitting_convention == '<='))
+        d = os.path.join(output_dir, 'build_x86', 'x86simulator_output')
+        os.makedirs(d, exist_ok=True)
+        # Tree-split partials sum to the score; put the whole of it on tile 0.
+        for i in range(model.n_outputs):
+            vals = q if i == 0 else np.zeros_like(q)
+            name = 'scores.dat' if i == 0 else f'scores.t{i}.dat'
+            with open(os.path.join(d, name), 'w') as f:
+                for v in vals:
+                    f.write(f'{int(v)}\n')
+        return True
+
+    model.write_input = write_input
+    model.platform = lambda: '/stub/platform.xpfm'
+    monkeypatch.setattr(tools, 'run_make', run_make)
+
+
+@pytest.mark.parametrize('n_rows', [1, 5, 32, 33, 64, 100])
+def test_decision_function_returns_one_score_per_row(skl_model, tmp_path, monkeypatch,
+                                                     n_rows):
+    """A long X is split across runs; a short one is padded. Either way, len(X) scores"""
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, NSamples=32, NTiles=2, SplitAxis='tree'))
+    model.write()
+    _stub_simulator(model, monkeypatch)
+
+    X = np.random.default_rng(0).uniform(-4, 4, size=(n_rows, model.n_features))
+    y = model.decision_function(X)
+    assert len(y) == n_rows, f'asked for {n_rows} scores, got {len(y)}'
+
+
+def test_decision_function_matches_a_reference_backend_exactly(skl_model, tmp_path,
+                                                               monkeypatch):
+    """Every returned score must equal the reference, not just the count"""
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, NSamples=32, NTiles=2, SplitAxis='tree'))
+    model.write()
+    _stub_simulator(model, monkeypatch)
+
+    X = np.random.default_rng(1).uniform(-4, 4, size=(70, model.n_features))
+    y = model.decision_function(X)
+    reference = model.score_p.dequantize(
+        model.tables.replay(X, model.threshold_p, model.score_p, model.init_predict[0],
+                            norm=model.norm,
+                            split_le=(model.splitting_convention == '<=')))
+    assert len(y) == len(X)
+    np.testing.assert_array_equal(y, reference)
