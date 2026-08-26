@@ -122,10 +122,19 @@ count up to a multiple of the vector width.
 ## `n_samples` is a batch size
 
 The graph is compiled for a fixed number of rows, so `n_samples` is how many samples one
-run scores - a property of the project, not of the model. `decision_function()` pads a
-shorter `X` up to it and runs the graph repeatedly for a longer one. Auto holds it at one
-target across mappings, rounded up to what the vector width and tile count require, so
-two configurations of the same model stay comparable.
+run scores - a property of the project, not of the model.
+
+**`decision_function(X)` accepts any number of rows.** A shorter `X` is padded up to the
+batch; a longer one is split across as many runs as it needs. Either way you get exactly
+`len(X)` scores back, and an INFO line says what it cost - padding rows that are computed
+and discarded, or the number of runs - so `NSamples` can be set to match a known workload.
+
+`NSamples` itself also accepts any value: a run is a whole number of `W`-sample groups
+(and, under sample-split, of tiles), so a value that does not divide is rounded up rather
+than refused, with an INFO saying so.
+
+Auto holds the batch at one target across mappings so two configurations of the same
+model stay comparable.
 
 ## How auto chooses
 

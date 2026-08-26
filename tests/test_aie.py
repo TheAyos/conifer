@@ -497,3 +497,43 @@ def test_too_few_groups_is_declined_not_guessed():
     _summarise_latency([300.0, 306.0], r)
     assert 'latency_ss_ns' not in r
     assert 'unmeasured' in r['latency_ss_note']
+
+
+# ----- n_samples is a batch, and any X length must work -----
+
+@pytest.mark.parametrize('asked', [1, 7, 100, 333, 512])
+def test_any_n_samples_is_accepted(skl_model, tmp_path, asked):
+    """A run is a whole number of groups, so round up rather than refuse"""
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, NSamples=asked))
+    assert model.n_samples >= asked
+    assert model.n_samples % model.batch_step == 0
+    assert model.n_samples - asked < model.batch_step
+
+
+def test_n_samples_is_left_alone_when_it_already_fits(skl_model, tmp_path):
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path, NSamples=8))
+    step = model.batch_step
+    exact = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path / 'b', NSamples=step * 3))
+    assert exact.n_samples == step * 3
+
+
+def test_a_short_batch_is_padded_not_refused(skl_model, tmp_path):
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path, NSamples=64))
+    model.write()
+    model.write_input(np.zeros((5, model.n_features)))
+    lines = sum(1 for _ in open(tmp_path / 'data/x.dat'))
+    assert lines * 4 == model.n_samples * model.n_features_padded
+
+
+def test_an_oversized_batch_is_refused_by_write_input(skl_model, tmp_path):
+    """decision_function splits a long X into runs; write_input takes one run"""
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path, NSamples=64))
+    model.write()
+    with pytest.raises(ValueError, match='exceeds'):
+        model.write_input(np.zeros((model.n_samples + 1, model.n_features)))

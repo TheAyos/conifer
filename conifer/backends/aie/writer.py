@@ -243,7 +243,7 @@ class AIEModel(ModelBase):
                 f'trees so every tile takes exactly tau={self.tau}')
 
         self.n_samples = (self._auto_n_samples() if cfg.n_samples == AUTO
-                          else int(cfg.n_samples))
+                          else self._round_batch(int(cfg.n_samples)))
         self.plio_rate = self._resolve_plio_rate()
         self._set_estimate()
 
@@ -256,6 +256,22 @@ class AIEModel(ModelBase):
             self.priority, self.oblique,
             'memtile' if getattr(self, 'feed_memtile', False) else 'plio')
 
+    @property
+    def batch_step(self):
+        '''Rows the graph must be compiled in whole multiples of'''
+        return self.W * (self.n_tiles if self.split_axis == 'sample' else 1)
+
+    def _round_batch(self, n):
+        '''A run is a whole number of groups, so round up rather than refuse'''
+        step = self.batch_step
+        if n < 1:
+            raise ValueError(f'n_samples must be at least 1, got {n}')
+        rounded = step * int(math.ceil(n / step))
+        if rounded != n:
+            logger.info(f'n_samples {n} rounded up to {rounded}: a run is a whole number '
+                        f'of {step}-sample groups')
+        return rounded
+
     def _auto_n_samples(self):
         '''Rows the graph is compiled for: a batch size, not a property of the model
 
@@ -267,12 +283,7 @@ class AIEModel(ModelBase):
         return step * int(math.ceil(DEFAULT_BATCH / step))
 
     def _check_shape(self):
-        if self.n_samples % self.W:
-            raise ValueError(f'n_samples {self.n_samples} must be a multiple of W {self.W}')
-        if self.split_axis == 'sample' and (self.n_samples // self.W) % self.n_tiles:
-            raise ValueError(
-                f'sample-split needs (n_samples / W) divisible by n_tiles, got '
-                f'({self.n_samples} / {self.W}) % {self.n_tiles}')
+        assert self.n_samples % self.batch_step == 0, 'batch is not a whole run'
         p = self.tables.nodes_per_tree
         if self.oblique:
             terms = self.basis['max_terms']
@@ -498,23 +509,33 @@ class AIEModel(ModelBase):
         X = np.asarray(X)
         assert X.shape[1] == self.n_features, \
             f'Wrong number of features, expected {self.n_features}, got {X.shape[1]}'
-        n = len(X)
-        self.write_input(X)
-        if not tools.run_make(self.config.output_dir, 'x86sim', PLATFORM=self.platform()):
-            return None
-        y = self.read_scores()
-        return y[:n]
+        n, batch = len(X), self.n_samples
+        runs = int(math.ceil(n / batch))
+        if runs > 1:
+            logger.info(f'scoring {n} samples in {runs} runs of {batch}: the graph is '
+                        f'compiled for a fixed batch, set NSamples to change it')
+        elif n < batch:
+            logger.info(f'scoring {n} samples in a graph compiled for {batch}; the '
+                        f'{batch - n} padding rows are computed and discarded, set '
+                        f'NSamples to trim them')
+        out = []
+        for i in range(runs):
+            self.write_input(X[i * batch:(i + 1) * batch])
+            if not tools.run_make(self.config.output_dir, 'x86sim',
+                                  PLATFORM=self.platform()):
+                return None
+            out.append(self.read_scores()[:batch])
+        return np.concatenate(out)[:n] if out else np.empty(0)
 
     def write_input(self, X):
         '''Feature-major, W-blocked, four values a line for the 64-bit PLIO'''
         cfg = self.config
         X = np.asarray(X, dtype=np.float64)
-        n = len(X)
-        if n % self.n_samples:
-            pad = self.n_samples - (n % self.n_samples)
-            logger.info(f'padding {n} samples to {n + pad}: the graph is compiled for '
-                        f'{self.n_samples} rows a run')
-            X = np.vstack([X, np.zeros((pad, X.shape[1]))])
+        if len(X) > self.n_samples:
+            raise ValueError(f'{len(X)} rows exceeds the {self.n_samples} this graph runs; '
+                             f'decision_function splits a longer X into runs')
+        if len(X) < self.n_samples:
+            X = np.vstack([X, np.zeros((self.n_samples - len(X), X.shape[1]))])
         if X.shape[1] != self.n_features_padded:
             X = np.hstack([X, np.zeros((len(X), self.n_features_padded - X.shape[1]))])
         xq = self.threshold_p.quantize(X)
