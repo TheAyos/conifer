@@ -220,3 +220,83 @@ def test_estimate_declares_its_extrapolations():
 def test_a_huge_ensemble_does_not_fit_one_tile():
     mem = mapper.table_bytes(10000, 4, 16, 16, 32, 2, 4, False)
     assert mem['total'] > 0x10000
+
+
+# ----- sharding -----
+
+def _sharded(skl_model, tmp_path, n_tiles=8, **kw):
+    clf, _ = skl_model
+    kw.setdefault('SplitAxis', 'tree')
+    return conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, NTiles=n_tiles, **kw))
+
+
+def test_tree_split_shards_and_feeds_from_a_memtile(skl_model, tmp_path):
+    model = _sharded(skl_model, tmp_path)
+    assert model.sharding is not None
+    assert model.feed_memtile
+    assert model.n_memtiles == 1
+    model.write()
+    header = open(tmp_path / 'src/parameters.h').read()
+    assert '#define BDT_SHARDED 1' in header
+    assert '#define BDT_FEED_MEMTILE 1' in header
+    for sym in ['N_SHARDS', 'WINDOWED', 'T_BEGIN', 'T_COUNT', 'N_FEAT', 'OFFSET']:
+        assert sym in header, f'missing bdtsh::{sym}'
+
+
+@pytest.mark.parametrize('n_tiles', [2, 4, 8, 16])
+def test_sharded_tables_score_exactly_what_unsharded_ones_do(skl_model, tmp_path, n_tiles):
+    '''The partial scores the tiles sum must equal the whole-ensemble score'''
+    model = _sharded(skl_model, tmp_path, n_tiles=n_tiles)
+    X = np.random.default_rng(0).uniform(-8, 8, size=(48, model.n_features))
+    bad = model.sharding.verify(X, model.threshold_p, model.score_p,
+                                model.init_predict[0], norm=model.norm,
+                                split_le=(model.splitting_convention == '<='))
+    assert len(bad) == 0
+
+
+def test_sharding_reduces_the_rows_a_tile_reads(skl_model, tmp_path):
+    from conifer.backends.aie.shard import Sharding
+    model = _sharded(skl_model, tmp_path, n_tiles=16)
+    identity = Sharding(model.tables, model.n_trees_padded, model.n_features_padded,
+                        16, fperm=list(range(model.n_features_padded)), optimize=False)
+    assert model.sharding.total_rows < identity.total_rows
+
+
+def test_sample_split_is_not_sharded(skl_model, tmp_path):
+    '''A sample-split tile holds the whole ensemble, so it reads every row'''
+    model = _sharded(skl_model, tmp_path, SplitAxis='sample', Priority='throughput')
+    assert model.sharding is None
+    assert not model.feed_memtile
+
+
+def test_sharding_can_be_turned_off(skl_model, tmp_path):
+    model = _sharded(skl_model, tmp_path, Shard=False)
+    assert model.sharding is None
+    model.write()
+    assert '#define BDT_SHARDED 0' in open(tmp_path / 'src/parameters.h').read()
+
+
+def test_memtile_can_be_declined_while_sharding(skl_model, tmp_path):
+    model = _sharded(skl_model, tmp_path, Feed='plio')
+    assert model.sharding is not None
+    assert not model.feed_memtile
+
+
+def test_tree_split_sums_the_per_tile_partial_scores(skl_model, tmp_path):
+    '''Each tile writes its own partial; read_scores must add them up'''
+    import os
+    model = _sharded(skl_model, tmp_path, n_tiles=4)
+    model.write()
+    assert model.n_outputs == 4
+    d = tmp_path / 'data'
+    os.makedirs(d, exist_ok=True)
+    n = model.n_samples
+    parts = [np.arange(n) * (i + 1) for i in range(4)]
+    for i, p in enumerate(parts):
+        name = 'scores.dat' if i == 0 else f'scores.t{i}.dat'
+        with open(d / name, 'w') as f:
+            for v in p:
+                f.write(f'T 100 ns\n{int(v)}\n')
+    got = model.read_scores()
+    np.testing.assert_allclose(got, model.score_p.dequantize(np.sum(parts, axis=0)))

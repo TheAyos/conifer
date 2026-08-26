@@ -1,11 +1,11 @@
 #pragma once
 
+#include <cstdint>
+#include "parameters.h"
+
 #ifndef BDT_SHARDED
 #define BDT_SHARDED 0
 #endif
-
-#include <cstdint>
-#include "parameters.h"
 
 #ifndef BDT_W
 #define BDT_W 16

@@ -48,6 +48,8 @@ in; passing that back reproduces the same project.
 | `VectorWidth` | `auto` | samples per invocation |
 | `Tau` | `auto` | trees per tile under tree-split |
 | `NSamples` | `auto` | rows the graph is compiled for |
+| `Shard` | `auto` | cut each tile's feature rows to a contiguous window (tree-split only) |
+| `Feed` | `auto` | `memtile` shares one input across the array; `plio` gives each tile a port |
 | `XilinxPart` | `xcve2802-vsvh1760-2MP-e-S` | selects the device record |
 | `ElfgenJobs` | unset | caps `aiecompiler` ELF generation fan-out |
 
@@ -62,6 +64,20 @@ WeightPrecision                                   ap_fixed<16,I,AP_RND_CONV,AP_S
 
 `AP_RND_CONV,AP_SAT` is required because the kernels are bit-exact against that grid;
 the `ap_fixed` default `AP_TRN,AP_WRAP` would score on a different one.
+
+## Sharding and the memtile feed
+
+Under tree-split with more than one tile the backend permutes trees and feature rows so
+each tile reads a contiguous window of rows rather than all of them, and feeds the array
+from a memtile: one input port writes each group into a shared buffer that every tile
+reads its own window from. Measured on VEK280 this is better on latency, period, port
+count and balance at every tile count.
+
+Sample-split is never sharded - a sample-split tile holds the whole ensemble, so it
+reads every row. Set `Shard=False` or `Feed='plio'` to decline either.
+
+Every sharded model is checked before it is emitted: the per-tile partial scores are
+replayed and required to sum to exactly what the unsharded tables score.
 
 ## Kernels
 

@@ -8,7 +8,7 @@ import numpy as np
 from conifer.utils import copydocstring
 from conifer.backends.common import MultiPrecisionConfig
 from conifer.model import ModelBase, ConfigBase
-from conifer.backends.aie import checks, mapper, tables as _tables
+from conifer.backends.aie import checks, mapper, shard as _shard, tables as _tables
 from conifer.backends.aie.precision import Precision, COMPARE_WIDTH, SCORE_WIDTH
 from conifer.backends.aie.devices import get_device_config
 from conifer.backends.aie.report import read_aie_report
@@ -26,13 +26,15 @@ class AIEConfig(MultiPrecisionConfig):
     backend = 'aie'
     _config_fields = MultiPrecisionConfig._config_fields + [
         'priority', 'n_tiles', 'split_axis', 'vector_width', 'tau', 'n_samples',
-        'xilinx_part', 'platform', 'elfgen_jobs']
+        'shard', 'feed', 'xilinx_part', 'platform', 'elfgen_jobs']
     _aie_alts = {'priority': ['Priority'],
                  'n_tiles': ['NTiles'],
                  'split_axis': ['SplitAxis'],
                  'vector_width': ['VectorWidth', 'W'],
                  'tau': ['Tau'],
                  'n_samples': ['NSamples'],
+                 'shard': ['Shard'],
+                 'feed': ['Feed'],
                  'xilinx_part': ['XilinxPart'],
                  'platform': ['Platform'],
                  'elfgen_jobs': ['ElfgenJobs'],
@@ -46,6 +48,8 @@ class AIEConfig(MultiPrecisionConfig):
                      'vector_width': AUTO,
                      'tau': AUTO,
                      'n_samples': AUTO,
+                     'shard': AUTO,
+                     'feed': AUTO,
                      'xilinx_part': 'xcve2802-vsvh1760-2MP-e-S',
                      'platform': None,
                      'elfgen_jobs': None,
@@ -111,7 +115,57 @@ class AIEModel(ModelBase):
 
         self._resolve_mapping()
         self._check_shape()
+        self._resolve_sharding()
         self.notes = self._notes
+
+    def _resolve_sharding(self):
+        '''Shard the tables so each tile reads a contiguous window of feature rows
+
+        Tree-split only: a sample-split tile holds the whole ensemble and reads every
+        row, so there is nothing to cut.
+        '''
+        self.sharding = None
+        self.feed_memtile = False
+        if self.config.shard in (False, 'false', 'off'):
+            return
+        if self.family != 'axis' or self.split_axis != 'tree' or self.n_tiles < 2:
+            return
+        self.sharding = _shard.Sharding(self.tables, self.n_trees_padded,
+                                        self.n_features_padded, self.n_tiles)
+        self._verify_sharding()
+        self.feed_memtile = self.config.feed != 'plio'
+        self._notes.append(
+            f'sharded: each tile reads {self.sharding.straggler_rows} of '
+            f'{self.n_features_padded} feature rows at worst '
+            f'({self.sharding.total_rows} across the array)'
+            + (', fed from a memtile' if self.feed_memtile else ''))
+        self._set_estimate()
+
+    def _verify_sharding(self, n_samples=32, seed=0):
+        '''Require the sharded tables to score exactly what the unsharded ones do'''
+        rng = np.random.default_rng(seed)
+        hi = self.threshold_p.max_representable
+        X = rng.uniform(-hi / 2, hi / 2, size=(n_samples, self.n_features))
+        if self.n_features_padded != self.n_features:
+            X = np.hstack([X, np.zeros((n_samples,
+                                        self.n_features_padded - self.n_features))])
+        bad = self.sharding.verify(X, self.threshold_p, self.score_p, self.init_predict[0],
+                                   norm=self.norm,
+                                   split_le=(self.splitting_convention == '<='))
+        if len(bad):
+            raise RuntimeError(
+                f'the sharded tables disagree with the unsharded ones on {len(bad)} of '
+                f'{n_samples} samples; this is a backend bug, please report it')
+
+    @property
+    def feature_order(self):
+        '''Which global feature sits in each row of the input file'''
+        return (self.sharding.fperm if self.sharding
+                else list(range(self.n_features_padded)))
+
+    @property
+    def n_memtiles(self):
+        return (self.n_tiles + 7) // 8 if self.feed_memtile else 0
 
     @property
     def family(self):
@@ -156,10 +210,16 @@ class AIEModel(ModelBase):
 
         self.n_samples = (self._auto_n_samples() if cfg.n_samples == AUTO
                           else int(cfg.n_samples))
+        self._set_estimate()
+
+    def _set_estimate(self):
+        rows = (self.sharding.straggler_rows if getattr(self, 'sharding', None)
+                else self.n_features_padded)
         self.estimate = mapper.estimate(
-            self.n_trees_padded, self.tables.max_depth, self.n_features_padded,
+            self.n_trees_padded, self.tables.max_depth, rows,
             self.n_tiles, self.W, self.threshold_p.n_bytes, self.score_p.n_bytes,
-            self.priority, self.oblique)
+            self.priority, self.oblique,
+            'memtile' if getattr(self, 'feed_memtile', False) else 'plio')
 
     def _auto_n_samples(self):
         step = self.W * (self.n_tiles if self.split_axis == 'sample' else 1)
@@ -210,6 +270,8 @@ class AIEModel(ModelBase):
                     'vector_width': self.W,
                     'tau': self.tau,
                     'n_samples': self.n_samples,
+                    'shard': self.sharding is not None,
+                    'feed': 'memtile' if self.feed_memtile else 'plio',
                     'xilinx_part': self.config.xilinx_part,
                     'platform': self.config.platform or self.device['platform'],
                     })
@@ -278,6 +340,13 @@ class AIEModel(ModelBase):
                 'config': self.resolved_config(),
                 'estimate': self.estimate,
                 'memory': self.memory,
+                'sharding': None if self.sharding is None else {
+                    'n_feat': self.sharding.n_feat,
+                    'straggler_rows': self.sharding.straggler_rows,
+                    'total_rows': self.sharding.total_rows,
+                    'feature_order': self.sharding.fperm,
+                },
+                'n_memtiles': self.n_memtiles,
                 'notes': self._notes,
                 }
 
@@ -290,12 +359,20 @@ class AIEModel(ModelBase):
         init_q = int(self.score_p.quantize([float(self.init_predict[0]) * self.norm])[0])
         all_ones = (1 << t.bv_bits) - 1
 
-        qt_feat = _pad(t.qt_group, T * P, 0)
-        qt_thr = _pad(list(q['qt_thr']), T * P, 0)
-        qt_bv = _pad(list(t.qt_bv), T * P, all_ones)
-        init_v = _pad(list(t.init_v), T, all_ones)
-        leaves = np.zeros((T, L), dtype=np.int64)
-        leaves[:t.n_trees] = q['leaves']
+        sh = self.sharding
+        if sh is None:
+            qt_feat = _pad(t.qt_group, T * P, 0)
+            qt_thr = _pad(list(q['qt_thr']), T * P, 0)
+            qt_bv = _pad(list(t.qt_bv), T * P, all_ones)
+            init_v = _pad(list(t.init_v), T, all_ones)
+            leaves = np.zeros((T, L), dtype=np.int64)
+            leaves[:t.n_trees] = q['leaves']
+        else:
+            qt_feat = list(sh.qt_group)
+            qt_thr = list(self.threshold_p.quantize(np.asarray(sh.qt_thr_f)))
+            qt_bv = list(sh.qt_bv)
+            init_v = list(sh.init_v)
+            leaves = self.score_p.quantize(sh.leaves * self.norm)
 
         s = ['// Generated by conifer. Do not edit.',
              '#pragma once', '#include <cstdint>', '']
@@ -307,8 +384,10 @@ class AIEModel(ModelBase):
                   f'#define BDT_MERGE_PLIO 1',
                   f'#define BDT_FEED_PLIO 0',
                   f'#define BDT_TAU {self.tau if self.split_axis == "tree" else 0}',
-                  '#define BDT_SHARDED 0',
-                  '#define BDT_FEED_MEMTILE 0',
+                  f'#define BDT_SHARDED {1 if self.sharding else 0}',
+                  f'#define BDT_FEED_MEMTILE {1 if self.feed_memtile else 0}',
+                  '#define BDT_MT_FANOUT 8',
+                  '#define BDT_MT_BUFFERS 2',
                   '#define BDT_TAP 0',
                   '#define BDT_PLACE 0',
                   '#define BDT_MERGE_REDUCE 0']
@@ -330,6 +409,17 @@ class AIEModel(ModelBase):
                   f'constexpr unsigned BASIS_N = {b["basis_n"]};',
                   f'constexpr unsigned MAX_TERMS = {b["max_terms"]};']
         s.append('')
+        if sh is not None:
+            s += ['}  // namespace bdtm', '', 'namespace bdtsh {', '',
+                  f'constexpr unsigned N_SHARDS = {self.n_tiles};',
+                  'constexpr bool WINDOWED = true;',
+                  _array('unsigned', 'T_BEGIN', sh.t_begin),
+                  _array('unsigned', 'T_COUNT', sh.t_count),
+                  _array('unsigned', 'N_FEAT', sh.n_feat),
+                  _array('unsigned', 'OFFSET', sh.offset),
+                  _array('unsigned', 'MASK',
+                         [sum(1 << f for f in fs) for fs in sh.feats]),
+                  '}  // namespace bdtsh', '', 'namespace bdtm {', '']
         s.append(_array('int16_t', 'QT_FEAT', qt_feat))
         s.append(_array(self.threshold_p.c_type, 'QT_THR', qt_thr))
         s.append(_array('bv_t', 'QT_BV', qt_bv, hexw=t.bv_bits))
@@ -384,7 +474,7 @@ class AIEModel(ModelBase):
         toks = []
         for g in range(0, len(xq), self.W):
             block = xq[g:g + self.W]
-            for k in range(self.n_features_padded):
+            for k in self.feature_order:
                 toks.extend(int(v) for v in block[:, k])
         per_line = 4
         os.makedirs(f'{cfg.output_dir}/data', exist_ok=True)
@@ -392,24 +482,52 @@ class AIEModel(ModelBase):
             for i in range(0, len(toks), per_line):
                 f.write(' '.join(str(v) for v in toks[i:i + per_line]) + '\n')
 
-    def read_scores(self, filename=None):
-        '''Integer scores from the simulator output, dequantized'''
-        cfg = self.config
-        paths = ([filename] if filename else
-                 [f'{cfg.output_dir}/x86simulator_output/data/scores.dat',
-                  f'{cfg.output_dir}/data/scores.dat',
-                  f'{cfg.output_dir}/aiesimulator_output/data/scores.dat'])
-        path = next((p for p in paths if os.path.exists(p)), None)
-        if path is None:
-            raise FileNotFoundError(f'No scores.dat found, looked in {paths}')
+    @property
+    def n_outputs(self):
+        '''Output ports the graph declares: one per tile unless a cascade merges them'''
+        return self.n_tiles if self.family == 'axis' else 1
+
+    def _score_dir(self):
+        for d in ('build_x86/x86simulator_output/data', 'build_hw/aiesimulator_output',
+                  'x86simulator_output/data', 'data'):
+            p = f'{self.config.output_dir}/{d}'
+            if os.path.exists(f'{p}/scores.dat'):
+                return p
+        raise FileNotFoundError(f'No scores.dat under {self.config.output_dir}')
+
+    def _read_one(self, path):
         vals = []
         with open(path) as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith('T '):
+                if not line or line.startswith('T'):
                     continue
                 vals.extend(int(v) for v in line.split())
-        return self.score_p.dequantize(np.asarray(vals, dtype=np.int64))
+        return np.asarray(vals, dtype=np.int64)
+
+    def read_scores(self, filename=None):
+        '''Integer scores from the simulator output, dequantized
+
+        Tree-split emits one partial score per tile, which sum to the ensemble score;
+        sample-split emits whole scores interleaved in turns of W.
+        '''
+        if filename is not None:
+            return self.score_p.dequantize(self._read_one(filename))
+        d = self._score_dir()
+        parts = [self._read_one(f'{d}/scores.dat' if i == 0 else f'{d}/scores.t{i}.dat')
+                 for i in range(self.n_outputs)]
+        if len(parts) == 1:
+            return self.score_p.dequantize(parts[0])
+        n = min(len(p) for p in parts)
+        parts = [p[:n] for p in parts]
+        if self.split_axis == 'tree':
+            return self.score_p.dequantize(np.sum(parts, axis=0))
+        out = np.empty(n * len(parts), dtype=np.int64)
+        for i, p in enumerate(parts):
+            for g in range(0, n, self.W):
+                out[i * self.W + g * len(parts): i * self.W + g * len(parts) + self.W] = \
+                    p[g:g + self.W]
+        return self.score_p.dequantize(out)
 
     @copydocstring(ModelBase.build)
     def build(self, **kwargs):
@@ -478,6 +596,8 @@ def auto_config(granularity='simple'):
               'VectorWidth': AUTO,
               'Tau': AUTO,
               'NSamples': AUTO,
+              'Shard': AUTO,
+              'Feed': AUTO,
               'XilinxPart': 'xcve2802-vsvh1760-2MP-e-S',
               }
     return config

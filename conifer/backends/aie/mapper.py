@@ -50,6 +50,11 @@ def vector_width(priority, max_depth):
     return max(MIN_VECTOR_WIDTH, w)
 
 
+# A memtile row is two 256-bit loads against sixteen 32-bit stream reads (FINDINGS 18:
+# the fill stops being a heterogeneity in time).
+_MEMTILE_ROW_FRACTION = 0.125
+
+
 def _row_cycles(W, feat_bytes):
     # A feature row is W * sizeof(feat_t) bytes taken four at a time, one 32-bit stream
     # read an instruction.
@@ -62,10 +67,15 @@ def _register_scale(W, feat_bytes):
     return max(1.0, W * feat_bytes / 64.0)
 
 
-def invocation_cycles(n_features, max_depth, tau, W, feat_bytes):
-    '''Cycles for one invocation, which scores W samples against tau trees'''
+def invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
+    '''Cycles for one invocation, which scores W samples against tau trees
+
+    n_features is the straggler's row count, which sharding reduces. A memtile row is
+    two wide loads rather than sixteen stream reads, so the fill term nearly vanishes.
+    '''
     base, per_tree = _DEPTH_COST[max_depth]
-    return base + n_features * _row_cycles(W, feat_bytes) + per_tree * _register_scale(W, feat_bytes) * tau
+    row = _row_cycles(W, feat_bytes) * (_MEMTILE_ROW_FRACTION if feed == 'memtile' else 1.0)
+    return base + n_features * row + per_tree * _register_scale(W, feat_bytes) * tau
 
 
 def _roundup(x, to):
@@ -115,11 +125,11 @@ def _tau_for(n_trees, n_tiles, split_axis):
 
 
 def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
-             priority, oblique=False):
+             priority, oblique=False, feed='plio'):
     '''Forward estimate for one mapping. An estimate, not a measurement: see validity'''
     split_axis = _split_axis(priority)
     tau = _tau_for(n_trees, n_tiles, split_axis)
-    inv = invocation_cycles(n_features, max_depth, tau, W, feat_bytes)
+    inv = invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed)
     samples_per_inv = W * (n_tiles if split_axis == 'sample' else 1)
 
     validity = []
