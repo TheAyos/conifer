@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 AUTO = 'auto'
 
+# Rows a graph is compiled to score in one run. Large enough to amortise the invocation
+# overhead, small enough that a cycle-accurate simulation stays affordable.
+DEFAULT_BATCH = 512
+
 _DEFAULT_COMPARE = 'ap_fixed<16,5,AP_RND_CONV,AP_SAT>'
 _DEFAULT_SCORE = 'ap_fixed<32,16,AP_RND_CONV,AP_SAT>'
 
@@ -188,18 +192,16 @@ class AIEModel(ModelBase):
         self.priority = cfg.priority
         self.split_axis = (('tree' if self.priority == 'latency' else 'sample')
                            if cfg.split_axis == AUTO else cfg.split_axis)
-        self.W = (mapper.vector_width(self.priority, d) if cfg.vector_width == AUTO
-                  else int(cfg.vector_width))
+        want_feed = 'plio' if cfg.feed == 'plio' else 'memtile'
+        feed = want_feed if self.split_axis == 'tree' else 'plio'
+        n, W, notes = mapper.choose_mapping(
+            self.tables.n_trees, d, self.n_features_padded,
+            self.threshold_p.n_bytes, self.score_p.n_bytes, self.priority,
+            self.device['n_tiles'], self.device['tile_memory_bytes'], self.oblique, feed,
+            n_tiles=None if cfg.n_tiles == AUTO else int(cfg.n_tiles),
+            W=None if cfg.vector_width == AUTO else int(cfg.vector_width))
+        self.n_tiles, self.W, self._notes = n, W, notes
         checks.check_vector_width(self.W, self.threshold_p.n_bytes)
-
-        if cfg.n_tiles == AUTO:
-            n, notes = mapper.choose_n_tiles(
-                self.tables.n_trees, d, self.n_features_padded, self.W,
-                self.threshold_p.n_bytes, self.score_p.n_bytes, self.priority,
-                self.device['n_tiles'], self.device['tile_memory_bytes'], self.oblique)
-            self.n_tiles, self._notes = n, notes
-        else:
-            self.n_tiles = int(cfg.n_tiles)
         checks.check_n_tiles(self.n_tiles, self.oblique, self.device['n_tiles'],
                              mapper.MAX_TEMPLATE_TILES)
 
@@ -231,8 +233,14 @@ class AIEModel(ModelBase):
             'memtile' if getattr(self, 'feed_memtile', False) else 'plio')
 
     def _auto_n_samples(self):
+        '''Rows the graph is compiled for: a batch size, not a property of the model
+
+        decision_function() pads a shorter X up to this and runs the graph repeatedly for
+        a longer one, so it trades simulation time against per-run overhead. Held at one
+        target across mappings so two configurations of the same model stay comparable.
+        '''
         step = self.W * (self.n_tiles if self.split_axis == 'sample' else 1)
-        return step * max(1, 256 // step)
+        return step * int(math.ceil(DEFAULT_BATCH / step))
 
     def _check_shape(self):
         f = self.n_features_padded

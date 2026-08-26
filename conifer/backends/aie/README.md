@@ -47,12 +47,12 @@ in; passing that back reproduces the same project.
 
 | field | default | meaning |
 |---|---|---|
-| `Priority` | `latency` | `latency` splits trees across tiles; `throughput` splits samples |
+| `Priority` | `latency` | `latency` splits trees across tiles; `throughput` splits samples. Also chooses the tile count and vector width |
 | `NTiles` | `auto` | 1–64 |
 | `SplitAxis` | `auto` | `tree` or `sample` |
-| `VectorWidth` | `auto` | samples per invocation |
+| `VectorWidth` | `auto` | samples per invocation; auto chooses from 8, 16, 32 |
 | `Tau` | `auto` | trees per tile under tree-split |
-| `NSamples` | `auto` | rows the graph is compiled for |
+| `NSamples` | `auto` | rows the graph is compiled to score in one run |
 | `Shard` | `auto` | `auto` searches the layout, `fast` skips the search, `False` disables sharding |
 | `Feed` | `auto` | `memtile` shares one input across the array; `plio` gives each tile a port |
 | `XilinxPart` | `xcve2802-vsvh1760-2MP-e-S` | selects the device record |
@@ -118,10 +118,30 @@ Warned, not raised:
 Padded, with an INFO message: oblique `n_features` up to a power of two, and the sample
 count up to a multiple of the vector width.
 
+## `n_samples` is a batch size
+
+The graph is compiled for a fixed number of rows, so `n_samples` is how many samples one
+run scores - a property of the project, not of the model. `decision_function()` pads a
+shorter `X` up to it and runs the graph repeatedly for a longer one. Auto holds it at one
+target across mappings, rounded up to what the vector width and tile count require, so
+two configurations of the same model stay comparable.
+
+## How auto chooses
+
+`Priority` fixes the split axis; the tile count and the vector width are then chosen
+together, on the metric the priority names, using the cost model below. They interact -
+a narrower vector is a smaller invocation, which helps latency only while the
+per-invocation setup is comparable to the per-tree work, so neither can be picked alone.
+
+Auto only chooses vector widths the study measured. Wider ones build and the cost model
+prices them, but set `VectorWidth` explicitly to use one.
+
 ## The estimate
 
 `write()` reports `est_cyc_per_sample` and `est_latency_ss_ns` from a cost model fitted
-on VEK280 measurements. It is an estimate, not a measurement, and it carries a
-`validity` list naming every extrapolation in play — a depth or vector width outside the
+on VEK280 measurements. It reproduces every measured point of the
+study's width sweep - depths 4 to 6 at widths 8 to 32 - within 9%, and both tile-count
+anchors exactly. It is still an estimate, not a measurement, and carries a `validity`
+list naming every extrapolation in play — a depth or vector width outside the
 fitted range, or an oblique model, for which no cost law was fitted. Use `build()` for
 real numbers.

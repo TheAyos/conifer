@@ -11,21 +11,23 @@ _DEPTH_COST = {2: (107, 50.5),
                3: (104, 91.0),
                4: (106, 156.0),
                5: (125, 410.4),
-               6: (125, 735.0),
+               6: (125, 1150.5),
                }
 
-# Depths whose per_tree is extrapolated from the bitvector step rather than fitted.
-_EXTRAPOLATED_DEPTHS = (6,)
+# Depths whose per_tree is extrapolated rather than fitted.
+_EXTRAPOLATED_DEPTHS = ()
 
-# Bits of result bitvector per lane, which sets the vector width the priority knob picks.
-_PRIORITY_BITS = {'latency': 512, 'throughput': 1024}
+# Measured: W=32 wins throughput at every depth, W=16 wins latency at every depth. The
+# invocation is what latency pays and W is what throughput divides by, so they pull apart.
+_PRIORITY_W = {'latency': 16, 'throughput': 32}
 
 # A latency mapping grows while a doubling of the tile count still buys this much.
 _MARGINAL_GAIN = 0.10
 
 # Sample-split throughput is linear in the tile count, and tree-split latency keeps paying
 # until tau reaches 1, so auto stops here to keep compile times reasonable and says so.
-_THROUGHPUT_DEFAULT_TILES = 8
+# One ceiling for both priorities: a different one per priority would let the latency
+# mapping out-run the throughput mapping on throughput.
 _AUTO_TILE_CEILING = 16
 
 # The kernel templates expand a per-tile ladder that stops here.
@@ -45,14 +47,74 @@ def bitvector_bits(max_depth):
 
 
 def vector_width(priority, max_depth):
-    '''The vector width the priority knob asks for, as a bitvector bit-target'''
-    w = _PRIORITY_BITS[priority] // bitvector_bits(max_depth)
-    return max(MIN_VECTOR_WIDTH, w)
+    '''Samples per invocation, from the priority knob
+
+    The measured optimum at the tau a latency mapping lands on. choose_mapping picks it
+    from the cost model instead when the tile count is free.
+    '''
+    return _PRIORITY_W[priority]
+
+
+VECTOR_WIDTHS = (8, 16, 32, 64)
+
+# What auto will choose from: the widths the study actually swept. Wider still builds and
+# the model will price it, but nothing on this device has measured it, so a user has to
+# ask for it by name.
+AUTO_VECTOR_WIDTHS = (8, 16, 32)
+
+
+def _metric(priority):
+    return ('est_latency_ss_ns' if priority == 'latency'
+            else 'est_throughput_ns_per_sample')
+
+
+def choose_mapping(n_trees, max_depth, n_features, feat_bytes, leaf_bytes, priority,
+                   max_tiles, tile_memory_bytes, oblique=False, feed='plio',
+                   n_tiles=None, W=None):
+    '''Pick the tile count and vector width together, on the metric the priority names
+
+    They interact: a narrower vector is a smaller invocation, which helps latency only
+    while the per-invocation setup is comparable to the per-tree work.
+    '''
+    notes = []
+    ceiling = min(max_tiles, MAX_TEMPLATE_TILES)
+    auto_ceiling = min(ceiling, _AUTO_TILE_CEILING)
+
+    tiles = [n_tiles] if n_tiles else (
+        [1] if oblique else [n for n in (1, 2, 4, 8, 16, 32, 64) if n <= auto_ceiling])
+    widths = [W] if W else list(AUTO_VECTOR_WIDTHS)
+
+    key = _metric(priority)
+    best, best_score = None, None
+    for n in tiles:
+        for w in widths:
+            if w * feat_bytes % 4:
+                continue
+            e = estimate(n_trees, max_depth, n_features, n, w, feat_bytes, leaf_bytes,
+                         priority, oblique, feed)
+            if best_score is None or e[key] < best_score:
+                best, best_score = (n, w), e[key]
+
+    n, w = best
+    if n_tiles is None and n == auto_ceiling < ceiling:
+        notes.append(f'stopping at {n} tiles: auto does not go past {auto_ceiling} to keep '
+                     f'compile time down, raise n_tiles for more')
+    if oblique:
+        notes.append('the oblique kernel is single-tile')
+    return n, w, notes
 
 
 # A memtile row is two 256-bit loads against sixteen 32-bit stream reads (FINDINGS 18:
 # the fill stops being a heterogeneity in time).
 _MEMTILE_ROW_FRACTION = 0.125
+
+# The width the cost table was fitted at, and one vector register.
+_FIT_W = 32
+_FIT_BYTES = 64
+_REGISTER_BITS = 512
+
+# The share of per-tree work that does not scale with the bitvector's register count.
+_PER_TREE_FLOOR = 0.5
 
 
 def _row_cycles(W, feat_bytes):
@@ -61,10 +123,18 @@ def _row_cycles(W, feat_bytes):
     return W * feat_bytes / 4
 
 
-def _register_scale(W, feat_bytes):
-    # per_tree was fitted at one 512-bit register of lanes. Below that the vector ops do
-    # not get cheaper; above it they multiply.
-    return max(1.0, W * feat_bytes / 64.0)
+def _bitvector_registers(W, max_depth):
+    return max(1, math.ceil(bitvector_bits(max_depth) * W / _REGISTER_BITS))
+
+
+def _register_scale(W, max_depth):
+    '''How per_tree moves with W: the bitvector's register count is what drives it
+
+    Only part of the per-tree work is bitvector-wide, so the scaling has a floor -
+    fitted across the measured depth and width sweep.
+    '''
+    ratio = _bitvector_registers(W, max_depth) / _bitvector_registers(_FIT_W, max_depth)
+    return _PER_TREE_FLOOR + (1.0 - _PER_TREE_FLOOR) * ratio
 
 
 def invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
@@ -75,7 +145,10 @@ def invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
     '''
     base, per_tree = _DEPTH_COST[max_depth]
     row = _row_cycles(W, feat_bytes) * (_MEMTILE_ROW_FRACTION if feed == 'memtile' else 1.0)
-    return base + n_features * row + per_tree * _register_scale(W, feat_bytes) * tau
+    # The setup term scales with the group, like the rows do: measured fixed roughly
+    # halves from W=32 to W=16.
+    base *= W * feat_bytes / _FIT_BYTES
+    return base + n_features * row + per_tree * _register_scale(W, max_depth) * tau
 
 
 def _roundup(x, to):
@@ -167,7 +240,7 @@ def choose_n_tiles(n_trees, max_depth, n_features, W, feat_bytes, leaf_bytes, pr
     candidates = [n for n in (1, 2, 4, 8, 16, 32, 64) if n <= ceiling]
 
     if priority == 'throughput':
-        n = min(_THROUGHPUT_DEFAULT_TILES, ceiling)
+        n = min(auto_ceiling, ceiling)
         if ceiling > n:
             notes.append(f'sample-split throughput scales linearly with tiles; stopping at '
                          f'{n} to keep compile time down, raise n_tiles for more')

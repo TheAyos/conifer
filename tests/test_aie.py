@@ -350,3 +350,67 @@ def test_scores_are_read_from_the_simulator_output_directory(skl_model, tmp_path
                 f.write(f'{v * (i + 1)}\n')
     got = model.read_scores()
     assert len(got) == model.n_samples
+
+
+# ----- the priority knob -----
+
+def test_each_priority_wins_its_own_metric(skl_model, tmp_path):
+    '''A throughput mapping must not be beaten on throughput by a latency mapping'''
+    clf, _ = skl_model
+    got = {}
+    for priority in ('latency', 'throughput'):
+        model = conifer.converters.convert_from_sklearn(
+            clf, _config(tmp_path / priority, Priority=priority))
+        got[priority] = model.estimate
+    assert got['latency']['est_latency_ss_ns'] < got['throughput']['est_latency_ss_ns']
+    assert (got['throughput']['est_throughput_ns_per_sample']
+            < got['latency']['est_throughput_ns_per_sample'])
+
+
+def test_both_priorities_compile_the_same_batch(skl_model, tmp_path):
+    '''n_samples is a batch size, so two mappings of one model stay comparable'''
+    clf, _ = skl_model
+    n = {p: conifer.converters.convert_from_sklearn(
+             clf, _config(tmp_path / p, Priority=p)).n_samples
+         for p in ('latency', 'throughput')}
+    assert n['latency'] == n['throughput']
+
+
+def test_auto_uses_one_tile_ceiling_for_both_priorities(skl_model, tmp_path):
+    clf, _ = skl_model
+    n = {p: conifer.converters.convert_from_sklearn(
+             clf, _config(tmp_path / p, Priority=p)).n_tiles
+         for p in ('latency', 'throughput')}
+    assert n['latency'] == n['throughput']
+
+
+def test_auto_picks_a_width_the_study_measured():
+    '''The cost model prices wider vectors but nothing on this device has measured them'''
+    for priority in ('latency', 'throughput'):
+        _, W, _ = mapper.choose_mapping(32, 4, 16, 2, 4, priority, 304, 0x10000)
+        assert W in mapper.AUTO_VECTOR_WIDTHS
+
+
+def test_latency_prefers_a_narrower_vector_than_throughput():
+    '''A narrower vector is a smaller invocation; a wider one amortises it over more'''
+    _, w_lat, _ = mapper.choose_mapping(32, 4, 16, 2, 4, 'latency', 304, 0x10000)
+    _, w_thr, _ = mapper.choose_mapping(32, 4, 16, 2, 4, 'throughput', 304, 0x10000)
+    assert w_lat < w_thr
+
+
+def test_an_explicit_width_is_honoured(skl_model, tmp_path):
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, VectorWidth=32))
+    assert model.W == 32
+
+
+@pytest.mark.parametrize('depth,W,measured', [
+    (4, 32, 518.0), (4, 16, 345.7),
+    (5, 32, 790.4), (5, 16, 500.4),
+    (6, 32, 1533.5), (6, 16, 981.9), (6, 8, 891.4),
+])
+def test_cost_model_tracks_the_measured_width_sweep(depth, W, measured):
+    '''One tree per tile, 16 features, int16 - the shape the widths were swept at'''
+    got = mapper.invocation_cycles(16, depth, 1, W, 2)
+    assert abs(got - measured) / measured < 0.10
