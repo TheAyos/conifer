@@ -85,7 +85,7 @@ def check_n_classes(n_classes):
             f'regression models only, got n_classes={n_classes}')
 
 
-def check_n_tiles(n_tiles, oblique, device_tiles, max_template_tiles):
+def check_n_tiles(n_tiles, oblique, device_tiles, plio_channels_out):
     if n_tiles < 1:
         raise ValueError(f'n_tiles must be at least 1, got {n_tiles}')
     if oblique and n_tiles > 1:
@@ -95,10 +95,11 @@ def check_n_tiles(n_tiles, oblique, device_tiles, max_template_tiles):
     if n_tiles > device_tiles:
         raise ValueError(
             f'n_tiles {n_tiles} exceeds the {device_tiles} AI Engine tiles on this device')
-    if n_tiles > max_template_tiles:
+    if plio_channels_out and n_tiles > plio_channels_out:
         raise ValueError(
-            f'n_tiles {n_tiles} exceeds the {max_template_tiles} the kernel templates '
-            f'expand to. This is a template limit, not a device one')
+            f'n_tiles {n_tiles} exceeds the {plio_channels_out} outgoing PLIO channels this '
+            f'device can route: every tile emits its own partial score on its own channel, '
+            f'on both split axes')
 
 
 def check_vector_width(W, feat_bytes):

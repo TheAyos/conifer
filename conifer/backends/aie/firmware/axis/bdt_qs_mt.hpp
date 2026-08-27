@@ -12,6 +12,7 @@
 #else
 #  define BDT_DECL_ROLE(S)  BDT_DECL_PLIO(S)
 #endif
+#define BDT_DECL_ROLE0(S) BDT_DECL_ROLE(S)
 
 // Whole ensemble: N=1, and every tile of a sample-split (they differ only in which
 // samples arrive, so they share one symbol).

@@ -55,8 +55,6 @@ void bdt_qs_mt(input_stream<feat_t>* __restrict xin,
 #endif
 #define BDT_DEF_ROLE0(S) BDT_DEF_ROLE(S)
 
-// The definitions this build maps, and only those -- same guards as the header, so a
-// declaration and its definition cannot disagree about which role a tile plays.
 // The definitions this build maps, from the SAME generated ladder the header declares
 // from, so a declaration and its definition cannot disagree about a tile's role.
 #define BDT_LADDER_DEF

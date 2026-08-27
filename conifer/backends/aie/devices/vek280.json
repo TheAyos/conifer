@@ -9,6 +9,7 @@
   "tile_memory_bytes": 65536,
   "memtile_bytes": 524288,
   "plio_columns": 28,
+  "plio_channels_out": 112,
   "clock_ghz": 1.25,
   "plio_rate_mhz": 625
 }

@@ -262,7 +262,7 @@ class AIEModel(ModelBase):
             self.n_tiles, self.W, self._notes = n, W, notes
             checks.check_vector_width(self.W, self.threshold_p.n_bytes)
             checks.check_n_tiles(self.n_tiles, self.oblique, self.device['n_tiles'],
-                                 mapper.MAX_TEMPLATE_TILES)
+                                 self.device.get('plio_channels_out'))
             self._finish_mapping(cfg)
             return
         want_feed = 'plio' if cfg.feed == 'plio' else 'memtile'
@@ -276,7 +276,7 @@ class AIEModel(ModelBase):
         self.n_tiles, self.W, self._notes = n, W, notes
         checks.check_vector_width(self.W, self.threshold_p.n_bytes)
         checks.check_n_tiles(self.n_tiles, self.oblique, self.device['n_tiles'],
-                             mapper.MAX_TEMPLATE_TILES)
+                             self.device.get('plio_channels_out'))
 
         self._finish_mapping(cfg)
 

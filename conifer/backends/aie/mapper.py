@@ -34,15 +34,17 @@ _MARGINAL_GAIN = 0.10
 # mapping out-run the throughput mapping on throughput.
 _AUTO_TILE_CEILING = 16
 
-# THE LADDER IS GENERATED PER PROJECT (roles.py), so it imposes no ceiling of its own.
-#
-# This was 64, which was how far somebody had written `#if BDT_N_TILES > k` out by hand --
-# a user-facing limit with nothing physical behind it. What remains is the DEVICE's core
-# count, which every device entry carries, so this is only the fallback for a device table
-# that does not state one. `xcve2802` has 304.
-MAX_TEMPLATE_TILES = 304
 
 MIN_VECTOR_WIDTH = 8
+
+
+def tile_candidates(ceiling):
+    """Powers of two up to a ceiling. The ladder is generated, so this follows the device."""
+    out, n = [], 1
+    while n <= ceiling:
+        out.append(n)
+        n *= 2
+    return out
 
 
 def bitvector_bits(max_depth):
@@ -86,11 +88,11 @@ def choose_mapping(n_trees, max_depth, n_features, feat_bytes, leaf_bytes, prior
     while the per-invocation setup is comparable to the per-tree work.
     '''
     notes = []
-    ceiling = min(max_tiles, MAX_TEMPLATE_TILES)
+    ceiling = max_tiles
     auto_ceiling = min(ceiling, _AUTO_TILE_CEILING)
 
     tiles = [n_tiles] if n_tiles else (
-        [1] if oblique else [n for n in (1, 2, 4, 8, 16, 32, 64) if n <= auto_ceiling])
+        [1] if oblique else tile_candidates(auto_ceiling))
     widths = [W] if W else list(AUTO_VECTOR_WIDTHS)
 
     key = _metric(priority)
@@ -277,9 +279,9 @@ def _requirement_candidates(n_trees, max_depth, n_features, feat_bytes, leaf_byt
     and is what a rate buys. Which of them serves a given (rate, budget) pair is exactly
     the question being asked, so neither is assumed.
     """
-    ceiling = min(max_tiles, MAX_TEMPLATE_TILES)
+    ceiling = max_tiles
     tiles = [n_tiles] if n_tiles else (
-        [1] if oblique else [n for n in (1, 2, 4, 8, 16, 32, 64) if n <= ceiling])
+        [1] if oblique else tile_candidates(ceiling))
     widths = [W] if W else list(AUTO_VECTOR_WIDTHS)
     out = []
     for axis in (('tree',) if oblique else ('tree', 'sample')):
@@ -411,13 +413,13 @@ def choose_n_tiles(n_trees, max_depth, n_features, W, feat_bytes, leaf_bytes, pr
                    max_tiles, tile_memory_bytes, oblique=False):
     '''Pick a tile count, and explain the choice. Returns (n_tiles, [notes])'''
     notes = []
-    ceiling = min(max_tiles, MAX_TEMPLATE_TILES)
+    ceiling = max_tiles
     auto_ceiling = min(ceiling, _AUTO_TILE_CEILING)
 
     if oblique:
         return 1, ['the oblique kernel is single-tile']
 
-    candidates = [n for n in (1, 2, 4, 8, 16, 32, 64) if n <= ceiling]
+    candidates = tile_candidates(ceiling)
 
     if priority == 'throughput':
         n = min(auto_ceiling, ceiling)

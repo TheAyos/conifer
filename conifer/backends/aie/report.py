@@ -14,8 +14,8 @@ _UNIT_NS = {'': 1.0, 's': 1e9, 'ms': 1e6, 'us': 1e3, 'ns': 1.0, 'ps': 1e-3}
 _RUNTIME = {'main', '_main_no_exit_init', '_main_init', '_start'}
 
 _NEXT_STAGE = {
-    'write': 'run compile() to map the design and get its real tile memory',
-    'compile': 'run build() for cycle counts and latency',
+    'write': 'run compile() to check the project builds, then build() for the mapped design',
+    'compile': 'run build() for the mapping, tile memory, cycle counts and latency',
     'build': None,
 }
 
@@ -137,8 +137,9 @@ def _build_metrics(sim_dir, meta, report):
         logger.warning(f'{len(cores)} cores active but the model declares {n_tiles} tiles; '
                        f'an idle tile would read as a speedup')
     if n_samples:
-        per_tile = n_samples / max(1, len(cores)) if split_axis == 'sample' else n_samples
-        cps = np.asarray([c['cyc'] for c in cores]) / per_tile
+        # Divided by what the ARRAY retired, not the tile's own share, so both axes
+        # report the same thing and the estimate can be compared against it.
+        cps = np.asarray([c['cyc'] for c in cores]) / n_samples
         report['cyc_per_sample'] = float(cps.max())
         report['cyc_per_sample_avg'] = float(cps.mean())
         report['straggler_ratio'] = float(cps.max() / cps.mean()) if cps.mean() else None

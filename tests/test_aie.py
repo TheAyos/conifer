@@ -146,8 +146,17 @@ def test_multiclass_is_rejected(tmp_path):
 
 def test_too_many_tiles_for_the_device(skl_model, tmp_path):
     clf, _ = skl_model
-    with pytest.raises(ValueError, match='template limit|AI Engine tiles'):
+    with pytest.raises(ValueError, match='AI Engine tiles'):
         conifer.converters.convert_from_sklearn(clf, _config(tmp_path, NTiles=1000))
+
+
+def test_more_tiles_than_the_shim_can_route(skl_model, tmp_path):
+    """Every tile emits its partial on its own outgoing PLIO channel, so the shim runs
+    out long before the cores do. aiecompiler only says so at -target=hw, minutes in.
+    """
+    clf, _ = skl_model
+    with pytest.raises(ValueError, match='outgoing PLIO channels'):
+        conifer.converters.convert_from_sklearn(clf, _config(tmp_path, NTiles=128))
 
 
 def test_oblique_rejects_multiple_tiles(ydf_model, tmp_path):
@@ -207,8 +216,8 @@ def test_priority_picks_opposite_split_axes():
 
 
 def test_auto_tiles_explains_where_it_stopped():
-    n, notes = mapper.choose_n_tiles(32, 4, 16, 32, 2, 4, 'latency', 304, 0x10000)
-    assert 1 <= n <= mapper.MAX_TEMPLATE_TILES
+    n, notes = mapper.choose_n_tiles(32, 4, 16, 32, 2, 4, 'latency', 112, 0x10000)
+    assert 1 <= n <= 112
     assert any('n_tiles' in s for s in notes)
 
 
@@ -734,6 +743,58 @@ def test_the_ladder_marks_tile_zero_and_only_tile_zero():
     decl, defn, _ = roles.ladder(4, 'tree', 'plio')
     assert decl[0] == 'BDT_DECL_ROLE0(0)' and defn[0] == 'BDT_DEF_ROLE0(0)'
     assert all('ROLE0' not in d for d in decl[1:] + defn[1:])
+
+
+def test_cyc_per_sample_is_the_arrays_cost_on_both_axes(monkeypatch):
+    """Sample-split tiles each score a slice, so dividing a tile's cycles by its own
+    slice reports a per-tile number where tree-split reports an array one -- and the
+    estimate, which is always an array number, then misses by exactly n_tiles.
+    """
+    from conifer.backends.aie import report as rpt
+    cores = [{'cyc': 12000, 'calls': 16, 'total': 13000} for _ in range(8)]
+    monkeypatch.setattr(rpt, '_cores', lambda d: cores)
+    monkeypatch.setattr(rpt, '_tree_split_latency', lambda *a: None)
+    for axis in ('sample', 'tree'):
+        out = {}
+        rpt._build_metrics('', {'config': {'n_tiles': 8, 'split_axis': axis},
+                                'n_samples': 512, 'clock_ghz': 1.25}, out)
+        assert out['cyc_per_sample'] == pytest.approx(12000 / 512), axis
+
+
+def test_every_macro_the_ladder_emits_is_defined_in_the_firmware():
+    """The generator names macros the kernels define, and nothing checks that pairing.
+
+    A generated call to a macro nobody defined is a compile error, which the
+    toolchain-free tests would otherwise never see -- and did not: BDT_DECL_ROLE0 was
+    emitted for tile 0 with only BDT_DEF_ROLE0 defined.
+    """
+    import re
+    import glob
+    from conifer.backends.aie import roles
+    firmware = os.path.join(os.path.dirname(conifer.backends.aie.__file__),
+                            'firmware', 'axis')
+    defined = set()
+    for path in glob.glob(os.path.join(firmware, '*')):
+        with open(path) as f:
+            defined |= set(re.findall(r'#\s*define\s+(BDT_(?:DECL|DEF)_\w+)\s*\(', f.read()))
+    emitted = set()
+    for n_tiles in (2, 3, 8, 128):
+        decl, defn, _ = roles.ladder(n_tiles, 'tree', 'plio')
+        emitted |= {line.split('(')[0] for line in decl + defn}
+    assert emitted and emitted <= defined, emitted - defined
+
+
+def test_the_search_space_follows_the_device_not_the_old_ladder():
+    """The ladder is generated per project, so nothing stops the search at 64 tiles.
+
+    A rate that no 64-tile mapping meets must come back on more than 64, not as
+    'no mapping in range' -- which is what a hardcoded candidate list would say.
+    """
+    assert mapper.tile_candidates(304) == [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    n, _, axis, _ = mapper.meet_requirement(200, 4, 16, 2, 2, max_tiles=304,
+                                            tile_memory_bytes=65536,
+                                            max_ns_per_sample=8.0)
+    assert n > 64 and axis == 'sample', (n, axis)
 
 
 # ----- things the phase 6.1 sweep caught -----

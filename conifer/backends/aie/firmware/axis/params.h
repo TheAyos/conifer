@@ -96,7 +96,6 @@ constexpr unsigned TAU = (BDT_TAU != 0) ? (unsigned)BDT_TAU
                                         : bdtm::N_TREES / N_SHARDS;
 static_assert(TAU <= bdtm::N_TREES, "tau exceeds the ensemble");
 
-static_assert(N_TILES <= 64, "no per-shard symbol exists past 64 tiles");
 
 constexpr bool SHARDED = (BDT_SHARDED != 0);
 
