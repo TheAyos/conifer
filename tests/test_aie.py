@@ -745,6 +745,23 @@ def test_the_ladder_marks_tile_zero_and_only_tile_zero():
     assert all('ROLE0' not in d for d in decl[1:] + defn[1:])
 
 
+def test_next_step_does_not_offer_what_the_report_already_holds(tmp_path):
+    """A hardware compile leaves the mapping behind without simulating, so the compile
+    stage can already carry the tile memory the generic hint tells a user to go and get.
+    """
+    from conifer.backends.aie.report import read_aie_report
+    work = tmp_path / 'build_x86' / 'Work'
+    work.mkdir(parents=True)
+    plain = read_aie_report(str(tmp_path))
+    assert plain['stage'] == 'compile' and 'tile memory' in plain['next_step']
+
+    (tmp_path / 'build_x86' / 'Map_Report.csv').write_text(
+        'CLUSTER,TILE\nPT0,"(1, 2)"\n\nBUFFER,MEMORY_GROUP,SIZE\nb0,"(1, 2)",256\n')
+    mapped = read_aie_report(str(tmp_path))
+    assert mapped['tile_memory_bytes_max'] == 256
+    assert 'tile memory' not in mapped['next_step']
+
+
 def test_cyc_per_sample_is_the_arrays_cost_on_both_axes(monkeypatch):
     """Sample-split tiles each score a slice, so dividing a tile's cycles by its own
     slice reports a per-tile number where tree-split reports an array one -- and the

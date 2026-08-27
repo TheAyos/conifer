@@ -19,6 +19,10 @@ _NEXT_STAGE = {
     'build': None,
 }
 
+# A hardware compile leaves the mapping behind without simulating, so the compile stage
+# can already carry what the generic hint offers to go and get.
+_NEXT_MAPPED = 'run build() for cycle counts and latency'
+
 
 def read_plio(path):
     '''Timestamps in ns and integer values from a PLIO .dat'''
@@ -289,4 +293,6 @@ def read_aie_report(output_dir) -> dict:
         _build_metrics(sim_dir, meta, report)
 
     report['next_step'] = _NEXT_STAGE.get(report['stage'])
+    if report['stage'] == 'compile' and 'tile_memory_bytes_max' in report:
+        report['next_step'] = _NEXT_MAPPED
     return report
