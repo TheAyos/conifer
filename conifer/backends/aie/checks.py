@@ -98,7 +98,7 @@ def check_n_tiles(n_tiles, oblique, device_tiles, plio_channels_out):
     if plio_channels_out and n_tiles > plio_channels_out:
         raise ValueError(
             f'n_tiles {n_tiles} exceeds the {plio_channels_out} outgoing PLIO channels this '
-            f'device can route: every tile emits its own partial score on its own channel, '
+            f'platform routes: every tile emits its own partial score on its own channel, '
             f'on both split axes')
 
 

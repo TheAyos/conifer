@@ -51,7 +51,7 @@ in; passing that back reproduces the same project.
 | field | default | meaning |
 |---|---|---|
 | `Priority` | `latency` | `latency` splits trees across tiles; `throughput` splits samples. Also chooses the tile count and vector width |
-| `NTiles` | `auto` | 1 to the outgoing PLIO channels the device routes (112 on a `vek280`) |
+| `NTiles` | `auto` | 1 to the outgoing PLIO channels the platform routes (112 on `vek280_base`) |
 | `SplitAxis` | `auto` | `tree` or `sample` |
 | `VectorWidth` | `auto` | samples per invocation; auto chooses from 8, 16, 32 |
 | `PlioRate` | `auto` | offered input rate in MHz; at most half the array clock |
@@ -110,8 +110,9 @@ Raised at `write()`:
 - oblique projection weights outside {0, ±1}
 - more than two classes — the kernels score one value per sample
 - an oblique model with `n_tiles > 1` — no multi-tile oblique kernel exists
-- `n_tiles` above the device's tile count, or above the outgoing PLIO channels it can
-  route: every tile emits its own partial score on its own channel, on both split axes
+- `n_tiles` above the device's tile count, or above the outgoing PLIO channels the
+  platform routes: every tile emits its own partial score on its own channel, on both
+  split axes, and the outgoing side binds first
 - unsupported precision width, rounding or overflow mode
 
 Warned, not raised:
