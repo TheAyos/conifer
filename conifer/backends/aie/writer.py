@@ -8,7 +8,7 @@ import numpy as np
 from conifer.utils import copydocstring
 from conifer.backends.common import MultiPrecisionConfig
 from conifer.model import ModelBase, ConfigBase
-from conifer.backends.aie import checks, mapper, shard as _shard, tables as _tables
+from conifer.backends.aie import checks, mapper, roles, shard as _shard, tables as _tables
 from conifer.backends.aie.precision import Precision, COMPARE_WIDTH, SCORE_WIDTH
 from conifer.backends.aie.devices import get_device_config
 from conifer.backends.aie.report import read_aie_report
@@ -442,6 +442,8 @@ class AIEModel(ModelBase):
         # The per-tile role ladder. A tile's tree range is baked into its symbol, so the
         # enumeration is unavoidable; writing it out by hand is what made 64 tiles a
         # ceiling the device does not have.
+        with open(f'{out}/src/tile_roles.h', 'w') as f:
+            f.write(roles.tile_roles_h(self.n_tiles, self.split_axis, 'plio'))
         with open(f'{out}/aie_model.json', 'w') as f:
             json.dump(self._model_json(), f, indent=2)
         self._write_makefile()
