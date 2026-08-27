@@ -34,8 +34,13 @@ _MARGINAL_GAIN = 0.10
 # mapping out-run the throughput mapping on throughput.
 _AUTO_TILE_CEILING = 16
 
-# The kernel templates expand a per-tile ladder that stops here.
-MAX_TEMPLATE_TILES = 64
+# THE LADDER IS GENERATED PER PROJECT (roles.py), so it imposes no ceiling of its own.
+#
+# This was 64, which was how far somebody had written `#if BDT_N_TILES > k` out by hand --
+# a user-facing limit with nothing physical behind it. What remains is the DEVICE's core
+# count, which every device entry carries, so this is only the fallback for a device table
+# that does not state one. `xcve2802` has 304.
+MAX_TEMPLATE_TILES = 304
 
 MIN_VECTOR_WIDTH = 8
 
@@ -120,6 +125,9 @@ _REGISTER_BITS = 512
 # The share of per-tree work that does not scale with the bitvector's register count.
 _PER_TREE_FLOOR = 0.5
 
+# The oblique basis kernel's cost against an equally-shaped axis-aligned one, measured.
+_OBLIQUE_TAX = 2.73
+
 
 def _row_cycles(W, feat_bytes):
     # A feature row is W * sizeof(feat_t) bytes taken four at a time, one 32-bit stream
@@ -202,11 +210,18 @@ def _tau_for(n_trees, n_tiles, split_axis):
 
 
 def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
-             priority, oblique=False, feed='plio'):
-    '''Forward estimate for one mapping. An estimate, not a measurement: see validity'''
-    split_axis = _split_axis(priority)
+             priority, oblique=False, feed='plio', split_axis=None):
+    '''Forward estimate for one mapping. An estimate, not a measurement: see validity
+
+    split_axis is normally the priority's, because a priority IS a choice of axis. It is
+    overridable so a REQUIREMENT can search both: given a rate to hold and a latency
+    budget to stay inside, which axis serves them is an answer rather than an input.
+    '''
+    split_axis = split_axis or _split_axis(priority)
     tau = _tau_for(n_trees, n_tiles, split_axis)
     inv = invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed)
+    if oblique:
+        inv *= _OBLIQUE_TAX
     samples_per_inv = W * (n_tiles if split_axis == 'sample' else 1)
 
     validity = []
@@ -223,8 +238,8 @@ def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
     if feat_bytes != 2:
         validity.append('the cost law was fitted at int16')
     if oblique:
-        validity.append('the oblique kernel has no fitted cost law; this is the '
-                        'axis-aligned law and understates it')
+        validity.append(f'the oblique cost is the axis-aligned law times the measured '
+                        f'{_OBLIQUE_TAX}x basis tax, not a law fitted on oblique kernels')
 
     return {'est_cyc_per_invocation': inv,
             'est_cyc_per_sample': inv / samples_per_inv,
@@ -234,6 +249,162 @@ def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
             'split_axis': split_axis,
             'validity': validity,
             }
+
+
+# --------------------------------------------------------------------------- #
+# The long form: a required rate and a latency budget, instead of a priority
+# --------------------------------------------------------------------------- #
+#
+# `priority` asks the mapper to be good at one of two things. A trigger does not want
+# that: it wants a rate it MUST hold, because the arrival rate is a physical constant,
+# and a latency it must stay inside. Those are requirements, and a mapping either meets
+# them or it does not.
+#
+# It is the same law, used backwards, and the reason it was not shipped in the first pass
+# is worth keeping in view: inverting a fitted law PROMISES something. The forward form
+# reports an estimate a user reads and judges; the inverse form says "this mapping meets
+# your requirement", and if the point it picked rests on an extrapolation then the promise
+# rests on one too. So the search reports which, prefers a point that does not, and never
+# silently returns one that does.
+
+
+def _requirement_candidates(n_trees, max_depth, n_features, feat_bytes, leaf_bytes,
+                            max_tiles, oblique, feed, n_tiles, W):
+    """Every mapping the search may return, with its forward estimate.
+
+    BOTH AXES, and that is the point of the long form. Tree-split divides the invocation
+    and is what a latency budget buys; sample-split multiplies the samples per invocation
+    and is what a rate buys. Which of them serves a given (rate, budget) pair is exactly
+    the question being asked, so neither is assumed.
+    """
+    ceiling = min(max_tiles, MAX_TEMPLATE_TILES)
+    tiles = [n_tiles] if n_tiles else (
+        [1] if oblique else [n for n in (1, 2, 4, 8, 16, 32, 64) if n <= ceiling])
+    widths = [W] if W else list(AUTO_VECTOR_WIDTHS)
+    out = []
+    for axis in (('tree',) if oblique else ('tree', 'sample')):
+        for n in tiles:
+            for w in widths:
+                if w * feat_bytes % 4:
+                    continue
+                e = estimate(n_trees, max_depth, n_features, n, w, feat_bytes,
+                             leaf_bytes, 'latency', oblique, feed, split_axis=axis)
+                out.append((n, w, axis, e))
+    return out
+
+
+def meet_requirement(n_trees, max_depth, n_features, feat_bytes, leaf_bytes,
+                     max_tiles, tile_memory_bytes, max_ns_per_sample=None,
+                     max_latency_ns=None, oblique=False, feed='plio',
+                     n_tiles=None, W=None, allow_extrapolated=False):
+    """The smallest mapping that holds a rate and stays inside a latency budget.
+
+    Returns (n_tiles, W, split_axis, notes). Either requirement may be None, in which
+    case it is not a constraint -- one of the two alone is a perfectly good question.
+
+    SMALLEST MEANS FEWEST TILES, then narrowest vector. A requirement is a floor, not an
+    objective: once two mappings both meet it, the one that spends less silicon is the
+    answer, and spending more to beat a requirement nobody stated is how a mapper ends up
+    recommending sixty-four tiles for a model that fits on four.
+
+    THE PROMISE IS ONLY AS GOOD AS THE LAW UNDER IT. Every estimate carries a `validity`
+    list naming the extrapolations in play -- an unswept width, a precision the law was
+    not fitted at, an oblique model whose cost it understates. A point with a non-empty
+    list can still be right, but it cannot be PROMISED, so the search prefers a clean
+    point and returns a qualified one only when asked or when nothing clean meets the
+    requirement -- saying so either way.
+    """
+    if max_ns_per_sample is None and max_latency_ns is None:
+        raise ValueError('meet_requirement needs a rate, a latency budget, or both')
+
+    cands = _requirement_candidates(n_trees, max_depth, n_features, feat_bytes,
+                                    leaf_bytes, max_tiles, oblique, feed, n_tiles, W)
+
+    def meets(e):
+        if max_ns_per_sample is not None \
+                and e['est_throughput_ns_per_sample'] > max_ns_per_sample:
+            return False
+        if max_latency_ns is not None and e['est_latency_ss_ns'] > max_latency_ns:
+            return False
+        return True
+
+    def fits(w):
+        # A mapping that does not fit tile memory is not a mapping. Sharding is not
+        # implemented in this backend, so every tile carries the whole ensemble's tables
+        # and the footprint does not shrink with the tile count -- which is why this is
+        # checked against the WIDTH and not against the tiles.
+        b = table_bytes(n_trees, max_depth, 1 << max_depth, n_features, w, feat_bytes,
+                        leaf_bytes, oblique)
+        return b['total'] <= tile_memory_bytes
+
+    ok = [c for c in cands if meets(c[3]) and fits(c[1])]
+    clean = [c for c in ok if not c[3]['validity']]
+    notes = []
+
+    pool = clean if (clean and not allow_extrapolated) else ok
+    if not pool:
+        # NOTHING MEETS IT, and saying WHICH HALF failed is most of the value of the
+        # answer: a rate that cannot be held and a latency that cannot be met call for
+        # different changes to the model.
+        best_rate = min(cands, key=lambda c: c[3]['est_throughput_ns_per_sample'])
+        best_lat = min(cands, key=lambda c: c[3]['est_latency_ss_ns'])
+        # WHICH FAILURE IT IS MATTERS, and there are two quite different ones. Either a
+        # requirement is out of reach on its own -- no mapping is fast enough, or none is
+        # prompt enough -- or each is reachable and NO SINGLE MAPPING does both. The
+        # second is the interesting one: it means the rate wants sample-split and the
+        # latency wants tree-split, and the model has to change rather than the mapping.
+        rate_ok = (max_ns_per_sample is None
+                   or best_rate[3]['est_throughput_ns_per_sample'] <= max_ns_per_sample)
+        lat_ok = (max_latency_ns is None
+                  or best_lat[3]['est_latency_ss_ns'] <= max_latency_ns)
+        if rate_ok and lat_ok:
+            msg = ['each requirement is reachable but no single mapping meets BOTH: the '
+                   'rate wants sample-split (many tiles, whole ensemble each) and the '
+                   'latency wants tree-split (many tiles, few trees each), and one graph '
+                   'is one axis. Shrink the ensemble, lower a requirement, or split the '
+                   'model across two graphs']
+        else:
+            msg = ['no mapping in range meets the requirement']
+        if max_ns_per_sample is not None:
+            msg.append('best rate reachable is '
+                       '{:.2f} ns/sample at {} tiles W={} ({}-split), against the '
+                       'required {:.2f}'.format(
+                           best_rate[3]['est_throughput_ns_per_sample'], best_rate[0],
+                           best_rate[1], best_rate[2], max_ns_per_sample))
+        if max_latency_ns is not None:
+            msg.append('best latency reachable is '
+                       '{:.1f} ns at {} tiles W={} ({}-split), against the budget '
+                       '{:.1f}'.format(
+                           best_lat[3]['est_latency_ss_ns'], best_lat[0], best_lat[1],
+                           best_lat[2], max_latency_ns))
+        raise ValueError('; '.join(msg))
+
+    if not clean and ok:
+        notes.append('every mapping that meets this requirement rests on an '
+                     'extrapolation of the cost law, so what follows is an expectation '
+                     'and not a promise -- see validity')
+
+    # Fewest tiles, then narrowest vector, then the better of the two on whichever
+    # requirement was given. A deterministic order, so the same request maps the same way
+    # twice.
+    def rank(c):
+        n, w, ax, e = c
+        tie = (e['est_latency_ss_ns'] if max_latency_ns is not None
+               else e['est_throughput_ns_per_sample'])
+        return (n, w, tie)
+
+    n, w, axis, e = min(pool, key=rank)
+    margin = []
+    if max_ns_per_sample is not None:
+        margin.append('{:.0f}% rate headroom'.format(
+            100 * (1 - e['est_throughput_ns_per_sample'] / max_ns_per_sample)))
+    if max_latency_ns is not None:
+        margin.append('{:.0f}% latency headroom'.format(
+            100 * (1 - e['est_latency_ss_ns'] / max_latency_ns)))
+    notes.append('{} tile(s), W={}, {}-split meets the requirement with {}'.format(
+        n, w, axis, ' and '.join(margin)))
+    notes.extend(e['validity'])
+    return n, w, axis, notes
 
 
 def choose_n_tiles(n_trees, max_depth, n_features, W, feat_bytes, leaf_bytes, priority,

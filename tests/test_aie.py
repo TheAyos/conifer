@@ -337,7 +337,12 @@ def test_platform_is_found_from_the_vitis_environment(tmp_path, monkeypatch):
     os.makedirs(d)
     open(d / 'xilinx_vek280_base_202610_1.xpfm', 'w').close()
     monkeypatch.setenv('XILINX_VITIS', str(root))
+    # EVERY root the search reads, not just the two the docstring names. `_roots()` also
+    # consults XILINX_HLS, so on a machine that has actually sourced settings64.sh this
+    # test found the REAL platform and failed -- a test that only isolates part of the
+    # environment is a test that passes on the machine it was written on.
     monkeypatch.delenv('PLATFORM_REPO_PATHS', raising=False)
+    monkeypatch.delenv('XILINX_HLS', raising=False)
     assert platforms.find_platform('vek280_base') == str(
         d / 'xilinx_vek280_base_202610_1.xpfm')
 
@@ -610,3 +615,211 @@ def test_decision_function_matches_a_reference_backend_exactly(skl_model, tmp_pa
                             split_le=(model.splitting_convention == '<=')))
     assert len(y) == len(X)
     np.testing.assert_array_equal(y, reference)
+
+
+# --------------------------------------------------------------------------- #
+# The long form: a required rate and a latency budget instead of a priority
+# --------------------------------------------------------------------------- #
+
+def test_a_requirement_picks_the_axis_rather_than_taking_it():
+    """A rate wants sample-split and a latency budget wants tree-split.
+
+    `priority` is a proxy for a requirement; given the requirement itself, which axis
+    serves it is an answer. So the two requirements, asked alone, must come back on
+    opposite axes -- which is the same fact `test_priority_picks_opposite_split_axes`
+    pins from the other end.
+    """
+    common = dict(max_tiles=64, tile_memory_bytes=65536)
+    _, _, ax_lat, _ = mapper.meet_requirement(100, 4, 16, 2, 2,
+                                              max_latency_ns=900.0, **common)
+    _, _, ax_rate, _ = mapper.meet_requirement(100, 4, 16, 2, 2,
+                                               max_ns_per_sample=20.0, **common)
+    assert ax_lat == 'tree' and ax_rate == 'sample', (ax_lat, ax_rate)
+
+
+def test_a_requirement_returns_the_smallest_mapping_that_meets_it():
+    """A requirement is a floor, not an objective.
+
+    Once two mappings both meet it, the one that spends less silicon is the answer;
+    beating a requirement nobody stated is how a mapper recommends sixty-four tiles for
+    a model that fits on four.
+    """
+    n, W, axis, _ = mapper.meet_requirement(32, 4, 16, 2, 2, max_tiles=64,
+                                            tile_memory_bytes=65536,
+                                            max_latency_ns=4000.0)
+    smaller = mapper.estimate(32, 4, 16, max(1, n // 2), W, 2, 2, 'latency',
+                              split_axis=axis)
+    assert smaller['est_latency_ss_ns'] > 4000.0, (n, smaller)
+
+
+def test_a_requirement_out_of_reach_says_which_half_failed():
+    """Refusing is the answer; refusing without saying why is not.
+
+    Two failures look alike and call for different fixes: a requirement no mapping
+    meets on its own, and a PAIR that no single mapping meets because the two halves
+    want opposite axes.
+    """
+    with pytest.raises(ValueError, match='no mapping in range'):
+        mapper.meet_requirement(100, 4, 16, 2, 2, max_tiles=64,
+                                tile_memory_bytes=65536, max_ns_per_sample=0.01)
+    with pytest.raises(ValueError, match='no single mapping meets BOTH'):
+        mapper.meet_requirement(100, 4, 16, 2, 2, max_tiles=64,
+                                tile_memory_bytes=65536,
+                                max_ns_per_sample=10.0, max_latency_ns=3000.0)
+
+
+def test_a_requirement_needs_at_least_one_requirement():
+    with pytest.raises(ValueError, match='needs a rate'):
+        mapper.meet_requirement(32, 4, 16, 2, 2, max_tiles=64,
+                                tile_memory_bytes=65536)
+
+
+def test_the_requirement_reaches_the_model_and_moves_the_mapping(skl_model, tmp_path):
+    """The knob is only shipped if a user can reach it from the config."""
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, MaxNsPerSample=60.0, MaxLatencyNs=2000.0))
+    assert model.estimate['est_throughput_ns_per_sample'] <= 60.0
+    assert model.estimate['est_latency_ss_ns'] <= 2000.0
+    # The estimate must describe the graph that is being BUILT, not the one the
+    # priority would have implied.
+    assert model.estimate['split_axis'] == model.split_axis
+    assert any('meets the requirement' in n for n in model._notes)
+
+
+def test_a_requirement_is_validated_like_any_other_field(skl_model, tmp_path):
+    clf, _ = skl_model
+    with pytest.raises(ValueError, match='positive number of nanoseconds'):
+        conifer.converters.convert_from_sklearn(clf, _config(tmp_path, MaxLatencyNs=-5))
+
+
+# --------------------------------------------------------------------------- #
+# The per-tile role ladder
+# --------------------------------------------------------------------------- #
+
+def test_the_role_ladder_is_generated_and_has_no_ceiling_of_its_own(skl_model, tmp_path):
+    """64 tiles was how far somebody had written `#if` out by hand, not a device limit.
+
+    A tile's tree range is baked into its symbol, so the enumeration is unavoidable and
+    `kernel::create` needs a literal name. Generating it is what makes the ceiling the
+    device's core count instead.
+    """
+    from conifer.backends.aie import roles
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, NTiles=100, Priority='latency'))
+    model.write()
+    text = open(tmp_path / 'src' / 'tile_roles.h').read()
+    assert model.n_tiles == 100
+    assert 'bdt_qs_tile_99' in text
+    for guard in ('BDT_LADDER_DECL', 'BDT_LADDER_DEF', 'BDT_LADDER_CREATE'):
+        assert f'#ifdef {guard}' in text
+    # No include guard: the file is included once per section.
+    assert '#pragma once' not in text
+
+
+def test_the_ladder_is_empty_where_one_symbol_serves_every_tile():
+    """Sample-split and N=1 run one symbol on every tile; the graph loops instead."""
+    from conifer.backends.aie import roles
+    for axis, n in (('sample', 8), ('tree', 1)):
+        decl, defn, create = roles.ladder(n, axis, 'plio')
+        assert (decl, defn, create) == ([], [], [])
+
+
+def test_the_ladder_marks_tile_zero_and_only_tile_zero():
+    """Tile 0 carries the ensemble's base score, so its definition differs from its
+    neighbours'. Its DECLARATION does not, and one name in both sections is what lets
+    the generator emit a single list."""
+    from conifer.backends.aie import roles
+    decl, defn, _ = roles.ladder(4, 'tree', 'plio')
+    assert decl[0] == 'BDT_DECL_ROLE0(0)' and defn[0] == 'BDT_DEF_ROLE0(0)'
+    assert all('ROLE0' not in d for d in decl[1:] + defn[1:])
+
+
+# ----- things the phase 6.1 sweep caught -----
+
+def test_sample_split_deals_a_file_per_tile(skl_model, tmp_path):
+    """Each tile scores its own samples, so each reads its own cut of the input"""
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, NTiles=4, SplitAxis='sample', Priority='throughput'))
+    model.write()
+    model.write_input(np.zeros((model.n_samples, model.n_features)))
+    written = sorted(f for f in os.listdir(tmp_path / 'data') if f.endswith('.dat'))
+    assert len(written) == model.n_tiles, f'expected one file per tile, got {written}'
+    key = f'.n{model.n_tiles}d{model.delta}'
+    for t in range(model.n_tiles):
+        assert f'x{key}.t{t}.dat' in written
+
+
+def test_tree_split_writes_one_input_file(skl_model, tmp_path):
+    """A memtile shares one stream, so there is nothing to deal"""
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, NTiles=4, SplitAxis='tree'))
+    model.write()
+    model.write_input(np.zeros((model.n_samples, model.n_features)))
+    written = [f for f in os.listdir(tmp_path / 'data') if f.endswith('.dat')]
+    assert written == ['x.dat']
+
+
+def test_the_deal_covers_every_sample_once(skl_model, tmp_path):
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, NTiles=4, SplitAxis='sample', Priority='throughput'))
+    model.write()
+    model.write_input(np.zeros((model.n_samples, model.n_features)))
+    total = sum(sum(1 for _ in open(tmp_path / 'data' / f))
+                for f in os.listdir(tmp_path / 'data') if f.endswith('.dat'))
+    assert total * 4 == model.n_samples * model.n_features_padded
+
+
+def test_leaves_are_stored_no_wider_than_they_need(skl_model, tmp_path):
+    """The leaf select chain runs at the stored width, not the accumulator's"""
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path))
+    model.write()
+    header = open(tmp_path / 'src/parameters.h').read()
+    assert 'typedef int32_t score_t;' in header
+    assert 'typedef int32_t leaf_t;' not in header, \
+        'leaves stored at the accumulator width doubles every broadcast and select'
+
+
+def test_oblique_estimate_carries_the_measured_tax(ydf_model, tmp_path):
+    ymodel, _ = ydf_model
+    model = conifer.converters.convert_from_ydf(ymodel, _oblique_config(tmp_path))
+    axis = mapper.estimate(model.tables.n_trees, model.tables.max_depth,
+                           model.n_features_padded, 1, model.W, 2, 4, 'latency')
+    assert (model.estimate['est_cyc_per_sample']
+            > 2 * axis['est_cyc_per_sample']), 'oblique must not be priced as axis-aligned'
+    assert any('tax' in v for v in model.estimate['validity'])
+
+
+def test_leaf_width_is_the_narrowest_that_holds_the_values(skl_model, tmp_path):
+    """The select chain runs at the stored width, so leaves narrow when they can"""
+    import re
+    clf, _ = skl_model
+    for integer_bits, tag in ((4, 'verywide'), (16, 'wide'), (19, 'narrow')):
+        score = f'ap_fixed<32,{integer_bits},AP_RND_CONV,AP_SAT>'
+        model = conifer.converters.convert_from_sklearn(
+            clf, _config(tmp_path / tag, ScorePrecision=score))
+        model.write()
+        header = open(tmp_path / tag / 'src/parameters.h').read()
+        declared = next(l for l in header.split('\n') if 'leaf_t;' in l)
+        values = [int(v) for v in
+                  re.search(r'LEAVES\[\d+\] = \{(.*?)\};', header, re.S).group(1)
+                  .replace('\n', '').split(',') if v.strip()]
+        peak = max(abs(v) for v in values)
+        want = next(b for b in (8, 16, 32) if peak <= 2 ** (b - 1) - 1)
+        assert f'int{want}_t' in declared, f'peak {peak} declared {declared}'
+
+
+def test_a_leaf_too_wide_for_16_bits_says_what_it_costs(skl_model, tmp_path, caplog):
+    """A wide binary point can block the narrowing; the user cannot see that alone"""
+    import logging
+    clf, _ = skl_model
+    with caplog.at_level(logging.INFO):
+        model = conifer.converters.convert_from_sklearn(
+            clf, _config(tmp_path, ScorePrecision='ap_fixed<32,4,AP_RND_CONV,AP_SAT>'))
+        model.write()
+    assert any('select chain runs at the stored width' in r.message for r in caplog.records)

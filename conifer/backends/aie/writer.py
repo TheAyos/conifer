@@ -30,9 +30,12 @@ _DEFAULT_SCORE = 'ap_fixed<32,16,AP_RND_CONV,AP_SAT>'
 class AIEConfig(MultiPrecisionConfig):
     backend = 'aie'
     _config_fields = MultiPrecisionConfig._config_fields + [
-        'priority', 'n_tiles', 'split_axis', 'vector_width', 'tau', 'n_samples',
+        'priority', 'max_ns_per_sample', 'max_latency_ns',
+        'n_tiles', 'split_axis', 'vector_width', 'tau', 'n_samples',
         'shard', 'feed', 'plio_rate', 'xilinx_part', 'platform', 'elfgen_jobs']
     _aie_alts = {'priority': ['Priority'],
+                 'max_ns_per_sample': ['MaxNsPerSample'],
+                 'max_latency_ns': ['MaxLatencyNs'],
                  'n_tiles': ['NTiles'],
                  'split_axis': ['SplitAxis'],
                  'vector_width': ['VectorWidth', 'W'],
@@ -49,6 +52,12 @@ class AIEConfig(MultiPrecisionConfig):
     _aie_defaults = {'precision': _DEFAULT_COMPARE,
                      'score_precision': _DEFAULT_SCORE,
                      'priority': 'latency',
+                     # The long form: a rate to hold and a latency to stay inside,
+                     # instead of a preference between them. Both None means the
+                     # priority knob decides, which is every configuration written
+                     # before these existed.
+                     'max_ns_per_sample': None,
+                     'max_latency_ns': None,
                      'n_tiles': AUTO,
                      'split_axis': AUTO,
                      'vector_width': AUTO,
@@ -62,7 +71,8 @@ class AIEConfig(MultiPrecisionConfig):
                      'elfgen_jobs': None,
                      }
     _defaults = {**MultiPrecisionConfig._defaults, **_aie_defaults}
-    _allow_undefined = [*MultiPrecisionConfig._allow_undefined] + ['platform', 'elfgen_jobs']
+    _allow_undefined = [*MultiPrecisionConfig._allow_undefined] + [
+        'platform', 'elfgen_jobs', 'max_ns_per_sample', 'max_latency_ns']
 
     def __init__(self, configDict, validate=True):
         super(AIEConfig, self).__init__(configDict, validate=False)
@@ -77,10 +87,26 @@ class AIEConfig(MultiPrecisionConfig):
     def default_config():
         return copy.deepcopy(AIEConfig._defaults)
 
+    def _validate(self):
+        # THE BASE CLASS CHECKS ONLY THAT NOTHING IS MISSING, so `_extra_validate` below
+        # has to be CALLED -- the cpp backend calls its own from here and this one did
+        # not, which left every check in it dead: an unknown `priority`, an unknown
+        # `feed`, an unknown `split_axis` and a mismatched input/threshold precision were
+        # all accepted silently and surfaced later as a KeyError inside the mapper, or
+        # not at all. Verified before fixing: `Priority='nonsense'` round-tripped into
+        # the config untouched.
+        super(AIEConfig, self)._validate()
+        self._extra_validate()
+
     def _extra_validate(self):
         if self.priority not in ('latency', 'throughput'):
             raise ValueError(f"priority must be 'latency' or 'throughput', got "
                              f"'{self.priority}'")
+        for k in ('max_ns_per_sample', 'max_latency_ns'):
+            v = getattr(self, k, None)
+            if v is not None and not (isinstance(v, (int, float)) and v > 0):
+                raise ValueError(f"{k} must be a positive number of nanoseconds, "
+                                 f"got '{v}'")
         if self.shard not in (AUTO, 'fast', True, False, 'false', 'off'):
             raise ValueError(f"shard must be '{AUTO}', 'fast' or False, got "
                              f"'{self.shard}'")
@@ -213,8 +239,32 @@ class AIEModel(ModelBase):
         self._notes = []
 
         self.priority = cfg.priority
+        # THE LONG FORM, when the user states a requirement instead of a preference.
+        # A rate that must be held and a latency that must be met are what a trigger
+        # actually has; `priority` is a proxy for them. Given either, the SPLIT AXIS
+        # stops being an input -- tree-split is what a latency budget buys and
+        # sample-split is what a rate buys, so which one serves the pair is an answer.
+        want = (getattr(cfg, 'max_ns_per_sample', None),
+                getattr(cfg, 'max_latency_ns', None))
         self.split_axis = (('tree' if self.priority == 'latency' else 'sample')
                            if cfg.split_axis == AUTO else cfg.split_axis)
+        if any(v is not None for v in want) and cfg.split_axis == AUTO:
+            n, W, axis, notes = mapper.meet_requirement(
+                self.tables.n_trees, d, self.n_features_padded,
+                self.threshold_p.n_bytes, self.score_p.n_bytes,
+                self.device['n_tiles'], self.device['tile_memory_bytes'],
+                max_ns_per_sample=want[0], max_latency_ns=want[1],
+                oblique=self.oblique,
+                feed='plio' if cfg.feed == 'plio' else 'memtile',
+                n_tiles=None if cfg.n_tiles == AUTO else int(cfg.n_tiles),
+                W=None if cfg.vector_width == AUTO else int(cfg.vector_width))
+            self.split_axis = axis
+            self.n_tiles, self.W, self._notes = n, W, notes
+            checks.check_vector_width(self.W, self.threshold_p.n_bytes)
+            checks.check_n_tiles(self.n_tiles, self.oblique, self.device['n_tiles'],
+                                 mapper.MAX_TEMPLATE_TILES)
+            self._finish_mapping(cfg)
+            return
         want_feed = 'plio' if cfg.feed == 'plio' else 'memtile'
         feed = want_feed if self.split_axis == 'tree' else 'plio'
         n, W, notes = mapper.choose_mapping(
@@ -228,6 +278,15 @@ class AIEModel(ModelBase):
         checks.check_n_tiles(self.n_tiles, self.oblique, self.device['n_tiles'],
                              mapper.MAX_TEMPLATE_TILES)
 
+        self._finish_mapping(cfg)
+
+    def _finish_mapping(self, cfg):
+        '''Everything that follows from (n_tiles, W, split_axis), whichever chose them.
+
+        Split out so the requirement path and the priority path cannot drift: tau, the
+        null-tree padding, the batch size and the forward estimate are consequences of
+        the mapping and not of how it was picked.
+        '''
         if self.split_axis == 'tree' and self.n_tiles > 1:
             self.tau = (int(math.ceil(self.tables.n_trees / self.n_tiles))
                         if cfg.tau == AUTO else int(cfg.tau))
@@ -250,11 +309,46 @@ class AIEModel(ModelBase):
     def _set_estimate(self):
         rows = (self.sharding.straggler_rows if getattr(self, 'sharding', None)
                 else self.n_features_padded)
+        # THE AXIS IS PASSED, not re-derived from the priority. Under the long form the
+        # two can differ -- a latency budget met by sample-split, say -- and an estimate
+        # that re-derived the axis would describe a graph this model is not building.
         self.estimate = mapper.estimate(
             self.n_trees_padded, self.tables.max_depth, rows,
             self.n_tiles, self.W, self.threshold_p.n_bytes, self.score_p.n_bytes,
             self.priority, self.oblique,
-            'memtile' if getattr(self, 'feed_memtile', False) else 'plio')
+            'memtile' if getattr(self, 'feed_memtile', False) else 'plio',
+            split_axis=self.split_axis)
+
+    def _leaf_bits(self, leaves_q):
+        '''Narrowest int that holds every quantized leaf
+
+        The leaf select chain runs at the stored width, so storing leaves in the
+        accumulator's width doubles every broadcast and select for nothing. Widening
+        happens once, at the accumulate.
+        '''
+        peak = int(np.max(np.abs(np.asarray(leaves_q, dtype=np.int64)))) if len(leaves_q) else 0
+        for bits in (8, 16, 32):
+            if peak <= 2 ** (bits - 1) - 1:
+                return min(bits, self.score_p.width)
+        return self.score_p.width
+
+    def _report_leaf_width(self, leaves_q, bits):
+        '''Say when a wider binary point is costing the leaf select chain'''
+        if bits <= 16 or self.score_p.width <= 16:
+            return
+        peak = int(np.max(np.abs(np.asarray(leaves_q, dtype=np.int64))))
+        headroom = peak / (2 ** 15 - 1)
+        spare = self.score_p.shift - int(np.ceil(np.log2(headroom)))
+        logger.info(
+            f'leaves stored as {bits}-bit: the largest is {peak}, over the {2 ** 15 - 1} a '
+            f'16-bit leaf holds. The select chain runs at the stored width, so this costs '
+            f'roughly 10% - ScorePrecision with {spare} fractional bits '
+            f'(ap_fixed<{self.score_p.width},{self.score_p.width - spare}>) would fit')
+
+    @property
+    def delta(self):
+        '''Samples a tile takes before the next tile's turn, under sample-split'''
+        return self.W
 
     @property
     def batch_step(self):
@@ -345,6 +439,9 @@ class AIEModel(ModelBase):
 
         with open(f'{out}/src/parameters.h', 'w') as f:
             f.write(self._parameters_h())
+        # The per-tile role ladder. A tile's tree range is baked into its symbol, so the
+        # enumeration is unavoidable; writing it out by hand is what made 64 tiles a
+        # ceiling the device does not have.
         with open(f'{out}/aie_model.json', 'w') as f:
             json.dump(self._model_json(), f, indent=2)
         self._write_makefile()
@@ -428,6 +525,9 @@ class AIEModel(ModelBase):
             init_v = list(sh.init_v)
             leaves = self.score_p.quantize(sh.leaves * self.norm)
 
+        leaf_bits = self._leaf_bits(leaves.ravel())
+        self._report_leaf_width(leaves.ravel(), leaf_bits)
+
         s = ['// Generated by conifer. Do not edit.',
              '#pragma once', '#include <cstdint>', '']
         s.append(f'#define BDT_W {self.W}')
@@ -449,7 +549,7 @@ class AIEModel(ModelBase):
         s += ['', 'namespace bdtm {', '',
               f'typedef {self.threshold_p.c_type} feat_t;',
               f'typedef {self.score_p.c_type} score_t;',
-              f'typedef {self.score_p.c_type} leaf_t;',
+              f'typedef {_int_c_type(leaf_bits)} leaf_t;',
               f'typedef {bv_c} bv_t;', '',
               f'constexpr unsigned N_FEATURES = {F};',
               f'constexpr unsigned N_TREES    = {T};',
@@ -546,9 +646,29 @@ class AIEModel(ModelBase):
                 toks.extend(int(v) for v in block[:, k])
         per_line = 4
         os.makedirs(f'{cfg.output_dir}/data', exist_ok=True)
-        with open(f'{cfg.output_dir}/data/x.dat', 'w') as f:
-            for i in range(0, len(toks), per_line):
-                f.write(' '.join(str(v) for v in toks[i:i + per_line]) + '\n')
+        lines = [' '.join(str(v) for v in toks[i:i + per_line])
+                 for i in range(0, len(toks), per_line)]
+        base = f'{cfg.output_dir}/data/x.dat'
+        for path, chunk in self._input_files(base, lines):
+            with open(path, 'w') as f:
+                f.write('\n'.join(chunk) + '\n')
+
+    def _input_files(self, base, lines):
+        '''One file, or one per tile when each scores its own samples
+
+        Sample-split deals whole turns of samples round-robin, so each tile reads its
+        own cut. The name carries the mapping, as the graph builds it.
+        '''
+        if self.feed_memtile or self.split_axis == 'tree' or self.n_tiles == 1:
+            return [(base, lines)]
+        lines_per_group = self.n_features_padded * self.W // 4
+        per_turn = lines_per_group * max(1, self.delta // self.W)
+        out = [[] for _ in range(self.n_tiles)]
+        for i in range(0, len(lines), per_turn):
+            out[(i // per_turn) % self.n_tiles].extend(lines[i:i + per_turn])
+        root, ext = os.path.splitext(base)
+        key = f'.n{self.n_tiles}d{self.delta}'
+        return [(f'{root}{key}.t{t}{ext}', out[t]) for t in range(self.n_tiles)]
 
     @property
     def n_outputs(self):
@@ -615,6 +735,13 @@ class AIEModel(ModelBase):
         dictionary of extracted report contents, with a 'stage' key naming what was found
         '''
         return read_aie_report(self.config.output_dir)
+
+
+_INT_C = {8: 'int8_t', 16: 'int16_t', 32: 'int32_t'}
+
+
+def _int_c_type(bits):
+    return _INT_C[bits]
 
 
 def _pad(values, n, fill):

@@ -6,3 +6,5 @@ dist/
 prj_*
 .pytest_cache
 .fp_converter*
+sweep_runs/
+sweep_results.json
