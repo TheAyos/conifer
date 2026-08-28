@@ -6,19 +6,13 @@
 
 using namespace adf;
 
-#if defined(__has_include)
-#if __has_include("xin_file.h")
-#include "xin_file.h"
-#endif
-#endif
-#ifndef XIN_FILE
-#define XIN_FILE "../../gen/out/fp32/data/X_fm_w16.dat"
-#endif
+// XIN_FILE is the PLIO stimulus path. params.h includes the generated
+// parameters.h, which defines it as this project's own data/x.dat, so there is
+// nothing to fall back to: a missing definition is a compile error, which is
+// what it should be.
 
 namespace bdtmt {
 
-// Every tile reads every feature row -- there is no per-shard feature frame for
-// an oblique node -- so a tree-split takes one input port and multicasts it.
 constexpr unsigned N_IN = SPLIT_TREE ? 1u : N_TILES;
 constexpr unsigned N_OUT = N_TILES; // every tile emits its own partial
 
@@ -38,7 +32,6 @@ class theGraph : public graph {
 private:
   kernel k[bdtmt::N_TILES];
 
-  // Every tile gets the same sizing and source; only its symbol differs.
   void configure(kernel &kk) {
     source(kk) = "src/bdt_qs_obl.cpp";
     runtime<ratio>(kk) = 1.0;
@@ -49,12 +42,12 @@ private:
         sizeof(bdtm::LEAVES) + sizeof(bdtm::INIT_V) + sizeof(bdtm::QT_BTERM) +
         sizeof(bdtm::QT_BSIGN) + sizeof(bdtm::BASIS_I) + sizeof(bdtm::BASIS_J) +
         sizeof(bdtm::BASIS_WI) + sizeof(bdtm::BASIS_WJ);
-    // The basis lives on the stack, one vector per entry, and it is the largest
-    // single thing this kernel holds. Tree-split does not make it smaller.
+    // The basis lives on the stack, one vector per entry. Tree-split does not
+    // make it smaller.
     constexpr unsigned XBYTES =
         (bdtm::N_FEATURES + bdtm::BASIS_N) * BDT_W * sizeof(bdtm::feat_t);
-    heap_size(kk) = ((TABLES + 2 * KIB - 1) / KIB) * KIB;
-    stack_size(kk) = ((XBYTES + 4 * KIB - 1) / KIB) * KIB;
+    heap_size(kk) = ((TABLES + KIB - 1) / KIB) * KIB + 2 * KIB;
+    stack_size(kk) = ((XBYTES + KIB - 1) / KIB) * KIB + 4 * KIB;
   }
 
 public:

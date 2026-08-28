@@ -1,4 +1,6 @@
 import copy
+import glob
+import hashlib
 import json
 import logging
 import math
@@ -232,7 +234,7 @@ class AIEModel(ModelBase):
         n, W, notes = mapper.choose_mapping(
             self.tables.n_trees, d, self.n_features_padded,
             self.threshold_p.n_bytes, self.score_p.n_bytes, self.priority,
-            self.device['n_tiles'], self.device['tile_memory_bytes'], self.oblique, feed,
+            self.device['n_tiles'], self.device['clock_ghz'], self.oblique, feed,
             n_tiles=None if cfg.n_tiles == AUTO else int(cfg.n_tiles),
             W=None if cfg.vector_width == AUTO else int(cfg.vector_width),
             basis_n=self.basis['basis_n'] if self.oblique else 0)
@@ -275,7 +277,7 @@ class AIEModel(ModelBase):
         self.estimate = mapper.estimate(
             self.n_trees_padded, self.tables.max_depth, rows,
             self.n_tiles, self.W, self.threshold_p.n_bytes, self.score_p.n_bytes,
-            self.priority, self.oblique,
+            self.priority, self.device['clock_ghz'], self.oblique,
             'memtile' if getattr(self, 'feed_memtile', False) else 'plio',
             split_axis=self.split_axis,
             basis_n=self.basis['basis_n'] if self.oblique else 0)
@@ -331,10 +333,18 @@ class AIEModel(ModelBase):
         '''Rows the graph is compiled for: a batch size, not a property of the model
 
         decision_function() pads a shorter X up to this and runs the graph repeatedly for
-        a longer one, so it trades simulation time against per-run overhead. Held at one
-        target across mappings so two configurations of the same model stay comparable.
+        a longer one, so it trades simulation time against per-run overhead. Held near one
+        target so two mappings of a model stay comparable -- near, not at, since a
+        sample-split run is W samples on every tile at once and can exceed the target on
+        its own.
         '''
         step = self.W * (self.n_tiles if self.split_axis == 'sample' else 1)
+        if self.split_axis == 'sample' and step > DEFAULT_BATCH:
+            self._notes.append(
+                f'sample-split gives all {self.n_tiles} tiles a group of {self.W} at once, '
+                f'so one run is {step} samples and the batch cannot be the {DEFAULT_BATCH} '
+                f'a tree-split of this model would use. Scoring fewer than {step} rows '
+                f'leaves some tiles with nothing but padding')
         return step * math.ceil(DEFAULT_BATCH / step)
 
     def _check_shape(self):
@@ -407,12 +417,51 @@ class AIEModel(ModelBase):
         with open(f'{out}/aie_model.json', 'w') as f:
             json.dump(self._model_json(), f, indent=2)
         self._write_makefile()
+        self._drop_stale_builds()
 
         for note in self._notes:
             logger.info(note)
         logger.info(f'estimated {self.estimate["est_cyc_per_sample"]:.1f} cyc/sample, '
                     f'latency_ss {self.estimate["est_latency_ss_ns"]:.0f} ns on '
                     f'{self.n_tiles} tile(s)')
+
+    def _sources_digest(self):
+        """What the toolchain reads: everything under src/, and the Makefile"""
+        out = self.config.output_dir
+        h = hashlib.sha256()
+        for path in sorted(glob.glob(f'{out}/src/*')) + [f'{out}/Makefile']:
+            h.update(os.path.basename(path).encode())
+            with open(path, 'rb') as f:
+                h.update(f.read())
+        return h.hexdigest()
+
+    def _drop_stale_builds(self):
+        """Remove a Work tree that was compiled from different sources
+
+        aiecompiler keeps its state in <target>/Work and reuses it. Writing a new
+        mapping into a directory that already holds one leaves the old per-core ELFs
+        in place -- the kernel symbols change with the split, the tile count changes
+        with the mapping, and what gets simulated is a mixture of the two. It cost a
+        run of the oblique example, where eight of sixteen cores kept an earlier
+        build and overflowed a stack the current kernel fits inside. Work is a cache,
+        so dropping it costs a recompile and nothing else.
+        """
+        out = self.config.output_dir
+        stamp = f'{out}/.aie_sources'
+        digest = self._sources_digest()
+        previous = None
+        if os.path.exists(stamp):
+            with open(stamp) as f:
+                previous = f.read().strip()
+        if previous == digest:
+            return
+        for name in ('build_x86', 'build_hw'):
+            if os.path.isdir(f'{out}/{name}'):
+                logger.info(f'the generated sources changed: removing {name}, which '
+                            f'aiecompiler would otherwise build on top of')
+                shutil.rmtree(f'{out}/{name}')
+        with open(stamp, 'w') as f:
+            f.write(digest)
 
     def _write_makefile(self):
         cfg = self.config
@@ -572,9 +621,18 @@ class AIEModel(ModelBase):
             logger.info(f'scoring {n} samples in {runs} runs of {batch}: the graph is '
                         f'compiled for a fixed batch, set NSamples to change it')
         elif n < batch:
-            logger.info(f'scoring {n} samples in a graph compiled for {batch}; the '
-                        f'{batch - n} padding rows are computed and discarded, set '
-                        f'NSamples to trim them')
+            msg = (f'scoring {n} samples in a graph compiled for {batch}; the '
+                   f'{batch - n} padding rows are computed and discarded, set '
+                   f'NSamples to trim them')
+            # Under sample-split the padding is not spread evenly: groups are dealt to
+            # tiles in turn, so a short X starves the tiles at the end of the round.
+            if self.split_axis == 'sample' and self.n_tiles > 1:
+                idle = self.n_tiles - math.ceil(n / self.W)
+                if idle > 0:
+                    msg += (f'. {idle} of the {self.n_tiles} tiles score only padding: '
+                            f'{n} rows fill {math.ceil(n / self.W)} of the {self.n_tiles} '
+                            f'groups a run deals')
+            logger.info(msg)
         out = []
         for i in range(runs):
             self.write_input(X[i * batch:(i + 1) * batch])
@@ -632,9 +690,13 @@ class AIEModel(ModelBase):
         '''Output ports the graph declares: every tile emits its own partial'''
         return self.n_tiles
 
-    def _score_dir(self):
-        for d in ('build_x86/x86simulator_output', 'build_hw/aiesimulator_output',
-                  'x86simulator_output', 'data'):
+    def _score_dir(self, simulator='x86'):
+        # x86 first by default: decision_function reads its own run, and a stale
+        # aiesimulator output from an earlier build() must not shadow it.
+        order = ('build_hw/aiesimulator_output',) if simulator == 'aie' else (
+            'build_x86/x86simulator_output', 'build_hw/aiesimulator_output',
+            'x86simulator_output', 'data')
+        for d in order:
             p = f'{self.config.output_dir}/{d}'
             if os.path.exists(f'{p}/scores.dat'):
                 return p
@@ -650,15 +712,19 @@ class AIEModel(ModelBase):
                 vals.extend(int(v) for v in line.split())
         return np.asarray(vals, dtype=np.int64)
 
-    def read_scores(self, filename=None):
+    def read_scores(self, filename=None, simulator='x86'):
         '''Integer scores from the simulator output, dequantized
 
         Tree-split emits one partial score per tile, which sum to the ensemble score;
         sample-split emits whole scores interleaved in turns of W.
+
+        simulator picks whose output to read: 'x86' is the run decision_function made,
+        'aie' the cycle-accurate one build() made. They score the same input and should
+        agree exactly.
         '''
         if filename is not None:
             return self.score_p.dequantize(self._read_one(filename))
-        d = self._score_dir()
+        d = self._score_dir(simulator)
         parts = [self._read_one(f'{d}/scores.dat' if i == 0 else f'{d}/scores.t{i}.dat')
                  for i in range(self.n_outputs)]
         if len(parts) == 1:
@@ -674,10 +740,58 @@ class AIEModel(ModelBase):
                     p[g:g + self.W]
         return self.score_p.dequantize(out)
 
-    @copydocstring(ModelBase.build)
-    def build(self, **kwargs):
+    def build(self, X=None, simulate=True, **kwargs):
+        '''Compile the mapping for hardware, and time it
+
+        Two toolchain stages, and which of them to run is what the arguments say.
+        aiecompiler places the design and reports what it costs; aiesimulator runs it
+        cycle-accurately, which needs a stimulus and takes roughly twice as long.
+
+        Parameters
+        ----------
+        X: array-like of shape (n_samples, n_features), optional
+            Rows for the cycle-accurate run to score. Read back with
+            read_scores(simulator='aie'). Defaults to whatever data/x.dat holds, or
+            zeros if nothing has been written -- fine for timing, which the kernels
+            spend the same cycles on whatever the data.
+
+        simulate: bool, optional
+            Run aiesimulator. False stops after the hardware compile, which gives the
+            placement, tile memory and program memory without the simulator's time.
+            Defaults to True.
+
+        Returns
+        ----------
+        success: bool
+        '''
+        if X is not None and not simulate:
+            raise ValueError('build(X=...) names rows to score but simulate=False '
+                             'runs nothing that would score them')
         self.write()
-        return tools.run_make(self.config.output_dir, 'aiesim', PLATFORM=self.platform())
+        if simulate:
+            self._stimulus(X)
+        return tools.run_make(self.config.output_dir, 'aiesim' if simulate else 'hw_build',
+                              PLATFORM=self.platform())
+
+    def _stimulus(self, X):
+        """What the cycle-accurate run will score, said out loud
+
+        The simulator reads its input from a file, and reports a missing one only after
+        it has compiled the whole graph. Which rows are in that file used to depend on
+        what the last decision_function() left behind -- an ordering dependence nothing
+        in the signature expressed, and the reason both examples carried a write_input
+        call and a comment explaining it.
+        """
+        path = f'{self.config.output_dir}/data/x.dat'
+        if X is not None:
+            self.write_input(X)
+        elif os.path.exists(path):
+            logger.info(f'simulating the rows already in {path}; pass build(X) to name '
+                        f'them, since decision_function() leaves its last batch here')
+        else:
+            logger.info(f'no input written yet: simulating {self.n_samples} rows of zeros '
+                        f'for timing. Pass build(X) for scores')
+            self.write_input(np.zeros((self.n_samples, self.n_features)))
 
     def read_report(self) -> dict:
         '''Read whatever stage of report is on disk

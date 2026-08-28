@@ -2,32 +2,31 @@
 #
 #   make x86sim_build   compile for x86 functional simulation
 #   make x86sim         ... and run it
-#   make aiesim         compile for hardware and run the cycle-accurate simulator
+#   make hw_build       compile for hardware: placement, tile memory, program memory
+#   make aiesim         ... and run the cycle-accurate simulator
 #   make clean
 #
 # Needs the Vitis AI Engine tools on PATH. PLATFORM is filled in by conifer when the
-# toolchain is present at write time; override it to build elsewhere.
+# toolchain is present at write time and can be overriden.
 
 PLATFORM ?= @PLATFORM@
 TOP       = @TOP@
 XLOPT    ?= 1
 
-# Caps aiecompiler's ELF generation fan-out. Empty means the toolchain default; set it
-# on a machine where a large tile count would otherwise exhaust memory.
+# Caps aiecompiler's ELF generation concurrency. Empty is toolchain default.
+# Reduce on a machine where a large tile count would otherwise exhaust memory.
 ELFGEN_JOBS ?= @ELFGEN_JOBS@
 
 SWDIR = build_x86
 HWDIR = build_hw
 
-# The input path reaches the graph through the generated parameters.h, never through a
-# -D flag: the quoting does not survive every Vitis release's wrapper build.
 AIE_FLAGS = --xlopt=$(XLOPT) \
             $(if $(ELFGEN_JOBS),--Xelfgen=-j$(ELFGEN_JOBS),) \
             -include=$(XILINX_VITIS)/aietools/include \
             -include="../" -include="../src" \
             -platform=$(PLATFORM) -workdir=./Work
 
-.PHONY: x86sim_build x86sim aiesim clean check-platform
+.PHONY: x86sim_build x86sim hw_build aiesim clean check-platform
 
 check-platform:
 	@test -f "$(PLATFORM)" || { \
@@ -35,8 +34,6 @@ check-platform:
 	  echo "  Source the Vitis settings64.sh, or pass PLATFORM=/path/to/x.xpfm"; \
 	  exit 1; }
 
-# aiecompiler runs from a subdirectory: the graph names its kernel sources as
-# "src/<file>.cpp", resolved against the parent of the working directory.
 x86sim_build: check-platform
 	mkdir -p $(SWDIR) && cd $(SWDIR) && \
 	aiecompiler $(AIE_FLAGS) -target=x86sim $(TOP)
@@ -44,10 +41,12 @@ x86sim_build: check-platform
 x86sim: x86sim_build
 	cd $(SWDIR) && x86simulator --pkg-dir=./Work -i=.. --dump
 
-aiesim: check-platform
+hw_build: check-platform
 	mkdir -p $(HWDIR) && cd $(HWDIR) && \
-	aiecompiler $(AIE_FLAGS) -target=hw $(TOP) && \
-	aiesimulator --pkg-dir=./Work -i.. --profile
+	aiecompiler $(AIE_FLAGS) -target=hw $(TOP)
+
+aiesim: hw_build
+	cd $(HWDIR) && aiesimulator --pkg-dir=./Work -i.. --profile
 
 clean:
 	rm -rf $(SWDIR) $(HWDIR) .Xil _ide .AIE_SIM_CMD_LINE_OPTIONS

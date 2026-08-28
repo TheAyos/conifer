@@ -2,7 +2,7 @@
 Convert a scikit-learn BDT to an AI Engine project.
 
 write() needs no toolchain. compile(), decision_function() and build() need the Vitis
-AI Engine tools on PATH; the platform is found from the Vitis environment.
+AI Engine tools on PATH.
 
 Run the toolchain stages with:  python sklearn_to_aie.py --build
 '''
@@ -16,8 +16,7 @@ from sklearn.ensemble import GradientBoostingClassifier
 
 import conifer
 
-# Importing conifer installs a root handler, which makes basicConfig a no-op, so the
-# level has to be set directly or the backend's INFO lines never appear.
+# show backend's INFO lines
 logging.getLogger().setLevel(logging.INFO)
 
 X, y = make_hastie_10_2(n_samples=10000, random_state=0)
@@ -26,10 +25,11 @@ X_train, y_train, X_test = X[:9000], y[:9000], X[9000:]
 clf = GradientBoostingClassifier(n_estimators=32, max_depth=4, random_state=0)
 clf.fit(X_train, y_train)
 
-# 'auto' asks the backend to choose the mapping. Set any handle explicitly to pin it.
+# 'auto' asks the backend to choose the mapping, set any handle explicitly to pin it
 cfg = conifer.backends.aie.auto_config()
 cfg['OutputDir'] = 'prj_aie'
 cfg['Priority'] = 'latency'
+
 
 model = conifer.converters.convert_from_sklearn(clf, cfg)
 model.write()
@@ -61,7 +61,16 @@ same = int(np.sum(np.sign(y_aie.ravel()) == np.sign(y_skl)))
 print(f'\nScored {len(y_aie)} samples, {same} of {len(y_aie)} with the same prediction '
       f'as scikit-learn')
 
-assert model.build(), 'aiesimulator failed, see the log named above'
+assert model.build(X_test[:256]), 'aiesimulator failed, see the log named above'
+
+y_hw = np.asarray(model.read_scores(simulator='aie')).ravel()[:256]
+if np.array_equal(y_hw, y_aie):
+    print(f'\naiesimulator and x86simulator agree exactly ({len(y_hw)}/{len(y_hw)})')
+else:
+    same = int(np.sum(y_hw == y_aie))
+    print(f'\naiesimulator and x86simulator differ: {same} of {len(y_hw)} equal, '
+          f'largest difference {np.max(np.abs(y_hw - y_aie)):.6g}')
+
 report = model.read_report()
 print(f"\nStage: {report['stage']}")
 print(f"  {report['cyc_per_sample']:.2f} cyc/sample on {report['n_active_cores']} tile(s)")

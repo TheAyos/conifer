@@ -7,14 +7,10 @@
 
 using namespace adf;
 
-#if defined(__has_include)
-#if __has_include("xin_file.h")
-#include "xin_file.h"
-#endif
-#endif
-#ifndef XIN_FILE
-#define XIN_FILE "../../gen/out/t32-d4-f16/int16/data/X_fm_w32_plio64.dat"
-#endif
+// XIN_FILE is the PLIO stimulus path. params.h includes the generated
+// parameters.h, which defines it as this project's own data/x.dat, so there is
+// nothing to fall back to: a missing definition is a compile error, which is
+// what it should be.
 namespace bdtmt {
 
 constexpr unsigned N_IN = FEED_MEMTILE                 ? N_MEMTILE
@@ -41,7 +37,6 @@ private:
   shared_buffer<bdtm::feat_t> mtx[bdtmt::N_MEMTILE];
 #endif
 
-  // Every tile gets the same sizing and source; only its symbol differs.
   void configure(kernel &kk) {
     source(kk) = "src/bdt_qs_mt.cpp";
     runtime<ratio>(kk) = 1.0;
@@ -51,8 +46,8 @@ private:
                                 sizeof(bdtm::QT_FEAT) + sizeof(bdtm::LEAVES) +
                                 sizeof(bdtm::INIT_V);
     constexpr unsigned XBYTES = bdtm::N_FEATURES * BDT_W * sizeof(bdtm::feat_t);
-    heap_size(kk) = ((TABLES + 2 * KIB - 1) / KIB) * KIB;
-    stack_size(kk) = ((XBYTES + 4 * KIB - 1) / KIB) * KIB;
+    heap_size(kk) = ((TABLES + KIB - 1) / KIB) * KIB + 2 * KIB;
+    stack_size(kk) = ((XBYTES + KIB - 1) / KIB) * KIB + 4 * KIB;
   }
 
 public:
@@ -77,8 +72,6 @@ public:
           (bdtmt::FEED_MEMTILE || bdtmt::SPLIT_TREE || bdtmt::N_TILES == 1)
               ? std::string(XIN_FILE)
               : bdtmt::tile_in_file(XIN_FILE, i);
-      // The offered rate, matched to the mapping under a latency run and left
-      // at the transport default otherwise -- see params.h.
       xin[i] = input_plio::create(name.c_str(), plio_64_bits, file.c_str(),
                                   bdtmt::PLIO_RATE);
     }
