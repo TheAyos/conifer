@@ -7,10 +7,6 @@
 
 using namespace adf;
 
-// XIN_FILE is the PLIO stimulus path. params.h includes the generated
-// parameters.h, which defines it as this project's own data/x.dat, so there is
-// nothing to fall back to: a missing definition is a compile error, which is
-// what it should be.
 namespace bdtmt {
 
 constexpr unsigned N_IN = FEED_MEMTILE                 ? N_MEMTILE

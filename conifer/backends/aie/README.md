@@ -214,7 +214,7 @@ tests a dense weight row over all of them, so there is nothing to narrow.
 
 Raised at `write()`:
 
-- `max_depth > 6` — the result bitvector holds one bit per leaf and reaches two words
+- `max_depth > 6` — not supported yet
 - oblique projection weights outside {0, ±1}
 - more than two classes — the kernels score one value per sample
 - `n_tiles` above the device's tile count, or above the outgoing PLIO channels the

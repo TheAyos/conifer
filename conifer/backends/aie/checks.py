@@ -2,8 +2,10 @@ import numpy as np
 import logging
 logger = logging.getLogger(__name__)
 
-# The generator's result bitvector is one bit per leaf and reaches two 32-bit words at
-# depth 6; there is no third word.
+# Not a kernel limit: BV_WORDS generalises, and depth 6 is already the two-word case.
+# It is where the evidence stops. The vendored kernel was never measured past 6, at 6 the
+# study's naive heap walk beats it by 14.4%, and the cost table and the width rule both
+# end there.
 MAX_DEPTH = 6
 
 _TOL = 1e-9
@@ -71,9 +73,8 @@ def check_weights(trees):
 def check_max_depth(max_depth):
     if max_depth > MAX_DEPTH:
         raise ValueError(
-            f'max_depth {max_depth} exceeds the aie backend maximum of {MAX_DEPTH}: the '
-            f'QuickScorer result bitvector holds one bit per leaf and reaches two 32-bit '
-            f'words at depth {MAX_DEPTH}')
+            f'max_depth {max_depth} is not supported yet: the aie backend goes up to '
+            f'{MAX_DEPTH}')
     if max_depth < 1:
         raise ValueError(f'max_depth must be at least 1, got {max_depth}')
 
