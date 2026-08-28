@@ -10,6 +10,28 @@ enough - `PLATFORM_REPO_PATHS` does not have to be set. Both the `vek280_base` a
 `xilinx_vek280_base_<version>` layouts are recognised. Set `Platform` to an `.xpfm`
 path to override.
 
+## Where things are
+
+This backend is larger than the other hardware ones because it has no HLS step to hand
+the hard problem to: `aiecompiler` places kernels but does not choose the parallelism,
+the data layout or the numeric grid, so the mapping is decided here.
+
+    writer.py     AIEConfig, AIEModel, and the four stages. Bulk-writes parameters.h
+    mapper.py     the cost model, and the policy that picks tiles, width and axis
+    tables.py     the QuickScorer tables, derived from the conifer ensemble
+    shard.py      tree and feature assignment, so each tile reads a row window
+    precision.py  ap_fixed -> integer width and binary point
+    checks.py     the guards, each raising with what to change
+    report.py     the staged report reader
+    roles.py      the per-tile kernel symbol ladder, generated per project
+    devices.py    device records (devices/*.json), read without any toolchain
+    platforms.py  locating a platform from the Vitis environment
+    tools.py      toolchain discovery, and running one Makefile target
+    firmware/     the vendored kernels: common/, axis/, oblique/
+    template/     the project Makefile
+
+Start at `writer.py`: it owns the model class and calls everything else.
+
 ## Quick start
 
 ```python
