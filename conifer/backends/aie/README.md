@@ -1,7 +1,7 @@
 # AI Engine backend
 
-Compiles a trained BDT to an AMD AI Engine project, using a vectorized QuickScorer
-kernel mapped across one or more AIE tiles.
+Compiles a trained BDT to an AMD AI Engine project, using vectorized branch-free kernels
+mapped across one or more AIE tiles.
 
 Target: VEK280 (`xcve2802`), AIE-ML.
 
@@ -18,7 +18,7 @@ the data layout or the numeric grid, so the mapping is decided here.
 
     writer.py     AIEConfig, AIEModel, and the four stages. Bulk-writes parameters.h
     mapper.py     the cost model, and the policy that picks tiles, width and axis
-    tables.py     the QuickScorer tables, derived from the conifer ensemble
+    tables.py     the node and leaf tables, derived from the conifer ensemble
     shard.py      tree and feature assignment, so each tile reads a row window
     precision.py  ap_fixed -> integer width and binary point
     checks.py     the guards, each raising with what to change
@@ -48,6 +48,10 @@ y = model.decision_function(X)       # x86simulator
 model.build()                        # aiecompiler + aiesimulator
 print(model.read_report())
 ```
+
+`examples/sklearn_to_aie.py` is the same thing end to end and runnable: it writes a
+project with no toolchain, and `--build` runs the three stages that need one and prints
+what each returns.
 
 ## The four stages
 
@@ -164,8 +168,20 @@ replayed and required to sum to exactly what the unwindowed tables score.
 
 | model | kernel | tiles |
 |---|---|---|
-| axis-aligned | QuickScorer, per-tree layout, multi-tile | 1–112 |
-| oblique, weights in {0, ±1} | QuickScorer with a partial-projection basis | 1–112 |
+| axis-aligned | per-tree table layout, multi-tile | 1–112 |
+| oblique, weights in {0, ±1} | partial-projection basis, multi-tile | 1–112 |
+
+Both are written for this backend. Neither walks a tree: every node in a tile's trees is
+evaluated, each failing node clears the leaves it rules out from a per-tree bitmask, and
+the surviving lowest bit is the exit leaf. There are no data-dependent branches and no
+pointer chasing, which is what makes the work vectorize across samples.
+
+That exit-leaf scheme is the one **QuickScorer** introduced (Lucchese et al., *QuickScorer:
+A Fast Algorithm to Rank Documents with Additive Ensembles of Regression Trees*, SIGIR
+2015), and the credit for it belongs there. Everything around it is this work: the
+vectorization across a sample group, the table layout, the multi-word bitmask that carries
+depth, the leaf select chain, the split across tiles, and the whole oblique path - the
+published algorithm is axis-aligned only and has no notion of a projection.
 
 An oblique split tests `w · x <= threshold`. Only binary ±1 projection weights are
 supported, which is what ydf's default `sparse_oblique_weights="BINARY"` emits.
