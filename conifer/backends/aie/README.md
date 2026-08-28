@@ -64,6 +64,7 @@ in; passing that back reproduces the same project.
 | `Shard` | `auto` | `auto` searches the layout, `fast` skips the search, `False` disables sharding |
 | `Feed` | `auto` | `memtile` shares one input across the array; `plio` gives each tile a port |
 | `XilinxPart` | `xcve2802-vsvh1760-2MP-e-S` | selects the device record |
+| `Platform` | `auto` | `.xpfm` to build against; found from the Vitis environment when unset |
 | `ElfgenJobs` | unset | caps `aiecompiler` ELF generation fan-out |
 
 Precisions follow conifer's usual fields. The compare path must be 16 bits and the

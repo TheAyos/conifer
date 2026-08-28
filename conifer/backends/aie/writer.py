@@ -79,13 +79,8 @@ class AIEConfig(MultiPrecisionConfig):
         return copy.deepcopy(AIEConfig._defaults)
 
     def _validate(self):
-        # THE BASE CLASS CHECKS ONLY THAT NOTHING IS MISSING, so `_extra_validate` below
-        # has to be CALLED -- the cpp backend calls its own from here and this one did
-        # not, which left every check in it dead: an unknown `priority`, an unknown
-        # `feed`, an unknown `split_axis` and a mismatched input/threshold precision were
-        # all accepted silently and surfaced later as a KeyError inside the mapper, or
-        # not at all. Verified before fixing: `Priority='nonsense'` round-tripped into
-        # the config untouched.
+        # The base class only checks that nothing is missing, so _extra_validate has to
+        # be called from here or every check in it is dead.
         super(AIEConfig, self)._validate()
         self._extra_validate()
 
@@ -227,9 +222,8 @@ class AIEModel(ModelBase):
         self.priority = cfg.priority
         self.split_axis = (('tree' if self.priority == 'latency' else 'sample')
                            if cfg.split_axis == AUTO else cfg.split_axis)
-        # An oblique node has a dense weight row and a basis over the global feature set,
-        # so there is no per-shard feature frame to hand a tile: the memtile feed and the
-        # sharding it carries are axis-aligned only.
+        # An oblique node reads a dense weight row, so there is no per-shard feature
+        # frame to hand a tile: the memtile feed and its sharding are axis-aligned only.
         want_feed = 'plio' if (cfg.feed == 'plio' or self.oblique) else 'memtile'
         feed = want_feed if self.split_axis == 'tree' else 'plio'
         n, W, notes = mapper.choose_mapping(
@@ -403,9 +397,8 @@ class AIEModel(ModelBase):
 
         with open(f'{out}/src/parameters.h', 'w') as f:
             f.write(self._parameters_h())
-        # The per-tile role ladder. A tile's tree range is baked into its symbol, so the
-        # enumeration is unavoidable; writing it out by hand is what made 64 tiles a
-        # ceiling the device does not have.
+        # A tile's tree range is baked into its symbol, so the enumeration is
+        # unavoidable; writing it by hand is what made 64 tiles a ceiling.
         with open(f'{out}/src/tile_roles.h', 'w') as f:
             f.write(roles.tile_roles_h(self.n_tiles, self.split_axis, 'plio'))
         with open(f'{out}/aie_model.json', 'w') as f:

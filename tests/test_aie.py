@@ -642,9 +642,7 @@ def test_decision_function_matches_a_reference_backend_exactly(skl_model, tmp_pa
     np.testing.assert_array_equal(y, reference)
 
 
-# --------------------------------------------------------------------------- #
-# The per-tile role ladder
-# --------------------------------------------------------------------------- #
+# ----- the per-tile role ladder -----
 
 def test_the_role_ladder_is_generated_and_has_no_ceiling_of_its_own(skl_model, tmp_path):
     """64 tiles was how far somebody had written `#if` out by hand, not a device limit.

@@ -4,9 +4,8 @@ logger = logging.getLogger(__name__)
 
 AIE_CLOCK_GHZ = 1.25
 
-# cyc/invocation = base + n_features * row + per_tree * tau, measured on the QuickScorer
-# per-tree kernel at n_features=16, W=32, int16. Piecewise in the bitvector width rather
-# than smooth in depth: the cost steps where bv_t widens.
+# cyc/invocation = base + n_features * row + per_tree * tau, measured at f16/W=32/int16.
+# Piecewise rather than smooth in depth: the cost steps where bv_t widens.
 _DEPTH_COST = {2: (107, 50.5),
                3: (104, 91.0),
                4: (106, 156.0),
@@ -21,10 +20,8 @@ _PRIORITY_W = {'latency': 16, 'throughput': 32}
 # A latency mapping grows while a doubling of the tile count still buys this much.
 _MARGINAL_GAIN = 0.10
 
-# Sample-split throughput is linear in the tile count, and tree-split latency keeps paying
-# until tau reaches 1, so auto stops here to keep compile times reasonable and says so.
-# One ceiling for both priorities: a different one per priority would let the latency
-# mapping out-run the throughput mapping on throughput.
+# Both priorities keep paying past this, so auto stops here for compile time and says so.
+# One ceiling for both: per-priority ceilings let one priority win the other's metric.
 _AUTO_TILE_CEILING = 16
 
 
@@ -58,9 +55,8 @@ def vector_width(priority, max_depth):
 
 VECTOR_WIDTHS = (8, 16, 32, 64)
 
-# What auto will choose from: the widths the study actually swept. Wider still builds and
-# the model will price it, but nothing on this device has measured it, so a user has to
-# ask for it by name.
+# The widths the study swept. Wider builds and is priced, but is unmeasured on this
+# device, so a user has to ask for it by name.
 AUTO_VECTOR_WIDTHS = (8, 16, 32)
 
 
@@ -100,7 +96,8 @@ def choose_mapping(n_trees, max_depth, n_features, feat_bytes, leaf_bytes, prior
         notes.append(f'stopping at {n} tiles: auto does not go past {auto_ceiling} to keep '
                      f'compile time down, raise n_tiles for more')
     if oblique:
-        notes.append('the oblique kernel is single-tile')
+        notes.append('oblique: tree-split does not divide the basis, so the speedup '
+                     'saturates against it however many tiles are added')
     return n, w, notes
 
 
@@ -116,14 +113,8 @@ _REGISTER_BITS = 512
 # The share of per-tree work that does not scale with the bitvector's register count.
 _PER_TREE_FLOOR = 0.5
 
-# THE OBLIQUE INVOCATION, MEASURED IN THREE TERMS rather than as one multiplier.
-#
-#   cyc/invocation = fixed + 11.9 * basis_n + 380 * tau
-#
-# The middle term is the signed pairs, built once per sample group over the whole feature
-# set. It is a property of the ENSEMBLE, not of the shard, so tree-split leaves it exactly
-# where it was and a single multiplier over the axis-aligned law would divide it too --
-# which is how a multi-tile oblique mapping ends up promised a speedup it cannot reach.
+# Measured: fixed + 11.9 * basis_n + 380 * tau. The basis belongs to the ensemble, not
+# the shard, so tree-split does not divide it -- and one multiplier would.
 _OBLIQUE_PER_TREE_TAX = 380.0 / 156.0
 _BASIS_CYC_PER_ENTRY = 11.9
 

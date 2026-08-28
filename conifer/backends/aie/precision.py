@@ -3,9 +3,8 @@ import numpy as np
 import logging
 logger = logging.getLogger(__name__)
 
-# The kernels compare and accumulate in native integers. The compare path is declared
-# int16 throughout (QT_THR_P, the node predicate, the oblique term loads), and the
-# accumulator tag is acc32, so neither width is a free choice.
+# The compare path is declared int16 throughout and the accumulator tag is acc32, so
+# neither width is a free choice.
 SUPPORTED_WIDTHS = (8, 16, 32)
 COMPARE_WIDTH = 16
 SCORE_WIDTH = 32
