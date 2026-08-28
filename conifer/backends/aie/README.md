@@ -190,3 +190,7 @@ on VEK280 measurements. It reproduces every measured point of the
 study's width sweep - depths 4 to 6 at widths 8 to 32 - within 9%, and both tile-count
 anchors exactly. It is still an estimate, not a measurement: use `build()` for real
 numbers.
+
+The oblique estimate is the weaker half. Its basis term is priced flat per entry from a
+`W=32` measurement, and that term is cheaper at narrower vectors, so an oblique estimate
+runs high at small `W` - about 8% on a `W=8` build.
