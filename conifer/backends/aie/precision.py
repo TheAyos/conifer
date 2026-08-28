@@ -12,8 +12,7 @@ SCORE_WIDTH = 32
 _C_TYPE = {8: 'int8_t', 16: 'int16_t', 32: 'int32_t'}
 
 # AP_RND_CONV is round-to-nearest-ties-to-even and AP_SAT saturates, which is exactly
-# numpy rint followed by clip. Any other pair would put the kernel on a different grid
-# from the golden.
+# numpy rint followed by clip. Any other pair would put the kernel on an unsupported grid.
 REQUIRED_ROUNDING = 'AP_RND_CONV'
 REQUIRED_OVERFLOW = 'AP_SAT'
 
@@ -52,10 +51,12 @@ class Precision:
             detail = (f'needs width {want}' if want else
                       f'supports widths {allowed}, not {self.width}')
             nearest = min(allowed, key=lambda w: (abs(w - self.width), w))
+            ibits = min(self.integer_bits, nearest)
             raise ValueError(f'{role} precision {self.type_string}: the aie backend '
                              f'{detail}. Use '
-                             f'ap_fixed<{nearest},{self.integer_bits},{REQUIRED_ROUNDING},'
-                             f'{REQUIRED_OVERFLOW}>')
+                             f'ap_fixed<{nearest},{ibits},{REQUIRED_ROUNDING},'
+                             f'{REQUIRED_OVERFLOW}>. Only the total width is fixed: the '
+                             f'integer bits are free.')
         if self.shift < 0:
             raise ValueError(f'{role} precision {self.type_string}: more integer bits than '
                              'total width')
@@ -63,8 +64,8 @@ class Precision:
             raise ValueError(
                 f'{role} precision {self.type_string}: the aie backend needs '
                 f'ap_fixed<{self.width},{self.integer_bits},{REQUIRED_ROUNDING},'
-                f'{REQUIRED_OVERFLOW}>. The kernels are bit-exact against that grid; '
-                f'{self.rounding},{self.overflow} would score on a different one')
+                f'{REQUIRED_OVERFLOW}>. The tables are quantized round-half-to-even and '
+                f'saturating')
 
     @property
     def n_bytes(self):

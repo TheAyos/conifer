@@ -3,23 +3,43 @@ import math
 
 logger = logging.getLogger(__name__)
 
-AIE_CLOCK_GHZ = 1.25
+VECTOR_WIDTHS = (8, 16, 32, 64)
+
+# A memtile row is two 256-bit loads against sixteen 32-bit stream reads
+_MEMTILE_ROW_FRACTION = 0.125
+
+# The width the cost table was fitted at, and one vector register
+_FIT_W = 32
+_FIT_BYTES = 64
+_REGISTER_BITS = 512
+
+# The share of per-tree work that does not scale with the bitvector's register count
+_PER_TREE_FLOOR = 0.5
+
+# Measured: fixed + 11.9 * basis_n + 380 * trees_per_tile
+_OBLIQUE_PER_TREE_TAX = 380.0 / 156.0
+_BASIS_CYC_PER_ENTRY = 11.9
 
 # cyc/invocation = base + n_features * row + per_tree * trees_per_tile, measured at f16/W=32/int16.
 # Piecewise rather than smooth in depth: the cost steps where bv_t widens.
-_DEPTH_COST = {2: (107, 50.5),
+_DEPTH_COST = {
+               # A stump: one node, and the only depth here that is not measured. Priced
+               # by the line per_tree = 26.7 + 8.70 * nodes, fitted on depths 2, 3 and 4 --
+               # the ones whose bitvector is also 16 bits. build() gives the real number.
+               1: (106, 35.4),
+               2: (107, 50.5),
                3: (104, 91.0),
                4: (106, 156.0),
                5: (125, 410.4),
                6: (125, 1150.5),
                }
 
-# Measured: W=32 wins throughput at every depth, W=16 wins latency at every depth. The
-# invocation is what latency pays and W is what throughput divides by, so they pull apart.
-_PRIORITY_W = {'latency': 16, 'throughput': 32}
+# An AIE-ML vector register is 512 or 1024 bits, and a partly filled one wastes the lanes
+# it does not use.
+_PRIORITY_REGISTER_BITS = {'latency': 512, 'throughput': 1024}
 
-# A latency mapping grows while a doubling of the tile count still buys this much.
-_MARGINAL_GAIN = 0.10
+# The narrowest group the study swept.
+MIN_VECTOR_WIDTH = 8
 
 # Auto stops here for compile time, but both priorities keep paying past this
 _AUTO_TILE_CEILING = 16
@@ -44,20 +64,39 @@ def bitvector_bits(max_depth):
     return 64
 
 
-def vector_width(priority, max_depth):
-    '''Samples per invocation, from the priority knob
+def lane_bits(max_depth, feat_bytes):
+    '''Bits per sample lane in the per-node loop
 
-    The measured optimum at the trees_per_tile a latency mapping lands on. choose_mapping picks it
-    from the cost model instead when the tile count is free.
+    Two vectors are touched at every node: the result bitvector, one bit per leaf, and
+    the compare. The accumulator and the leaf select are wider per lane but run once per
+    TREE, so they do not set the loop's register pressure -- sizing on the accumulator
+    would ask for W=16 at depth 4, and measurement there prefers 32.
     '''
-    return _PRIORITY_W[priority]
+    return max(bitvector_bits(max_depth), 8 * feat_bytes)
 
 
-VECTOR_WIDTHS = (8, 16, 32, 64)
+def vector_width(priority, max_depth, feat_bytes):
+    '''Samples per invocation: the group whose inner-loop vector fills the register
 
-# The widths the study swept. Wider builds and is priced, but is unmeasured on this
-# device, so a user has to ask for it by name.
-AUTO_VECTOR_WIDTHS = (8, 16, 32)
+    Latency fills the 512-bit register and throughput the 1024-bit one -- a bigger group
+    is more work in flight, which a rate wants and a deadline does not. What varies is
+    what a lane costs: a deeper ensemble carries more leaf bits, so it wants a narrower
+    group to fill the same register.
+
+    Measured on one tile, int16, t32-f16, aiesimulator:
+
+        depth 4 (16-bit lane)   latency_ss  W=16 4316.0 ns   W=32  4291.8 ns
+        depth 5 (32-bit lane)   latency_ss  W=16 7978.9 ns   W=32 10816.0 ns
+
+    The winner flips exactly where a lane doubles, and both winners are the width that
+    puts 512 bits of bitvector in the register. Throughput measured the same way prefers
+    W=64 at depth 4 by 12.6%.
+    '''
+    W = _PRIORITY_REGISTER_BITS[priority] // lane_bits(max_depth, feat_bytes)
+    # A vector is at most 1024 bits, and nothing narrower than the study swept has been
+    # measured. Both bite only past depth 6, which the backend refuses today.
+    return min(max(W, MIN_VECTOR_WIDTH), 1024 // (8 * feat_bytes))
+
 
 
 def _metric(priority):
@@ -66,32 +105,28 @@ def _metric(priority):
 
 
 def choose_mapping(n_trees, max_depth, n_features, feat_bytes, leaf_bytes, priority,
-                   max_tiles, tile_memory_bytes, oblique=False, feed='plio',
+                   max_tiles, clock_ghz, oblique=False, feed='plio',
                    n_tiles=None, W=None, basis_n=0):
-    '''Pick the tile count and vector width together, on the metric the priority names
-
-    They interact: a narrower vector is a smaller invocation, which helps latency only
-    while the per-invocation setup is comparable to the per-tree work.
-    '''
+    '''Pick the tile count, on the metric the priority names. W follows the priority.'''
     notes = []
     ceiling = max_tiles
     auto_ceiling = min(ceiling, _AUTO_TILE_CEILING)
 
     tiles = [n_tiles] if n_tiles else tile_candidates(auto_ceiling)
-    widths = [W] if W else list(AUTO_VECTOR_WIDTHS)
+    # W is not searched. It follows from the register the priority wants to fill, which
+    # the cost law is in no position to improve on: it was never fitted across W and
+    # ranks the two candidate widths the wrong way round on the latency arm.
+    w = W or vector_width(priority, max_depth, feat_bytes)
 
     key = _metric(priority)
     best, best_score = None, None
     for n in tiles:
-        for w in widths:
-            if w * feat_bytes % 4:
-                continue
-            e = estimate(n_trees, max_depth, n_features, n, w, feat_bytes, leaf_bytes,
-                         priority, oblique, feed, basis_n=basis_n)
-            if best_score is None or e[key] < best_score:
-                best, best_score = (n, w), e[key]
+        e = estimate(n_trees, max_depth, n_features, n, w, feat_bytes, leaf_bytes,
+                     priority, clock_ghz, oblique, feed, basis_n=basis_n)
+        if best_score is None or e[key] < best_score:
+            best, best_score = n, e[key]
 
-    n, w = best
+    n = best
     if n_tiles is None and n == auto_ceiling < ceiling:
         notes.append(f'stopping at {n} tiles: auto does not go past {auto_ceiling} to keep '
                      f'compile time down, raise n_tiles for more')
@@ -100,23 +135,6 @@ def choose_mapping(n_trees, max_depth, n_features, feat_bytes, leaf_bytes, prior
                      'saturates against it however many tiles are added')
     return n, w, notes
 
-
-# A memtile row is two 256-bit loads against sixteen 32-bit stream reads (FINDINGS 18:
-# the fill stops being a heterogeneity in time).
-_MEMTILE_ROW_FRACTION = 0.125
-
-# The width the cost table was fitted at, and one vector register.
-_FIT_W = 32
-_FIT_BYTES = 64
-_REGISTER_BITS = 512
-
-# The share of per-tree work that does not scale with the bitvector's register count.
-_PER_TREE_FLOOR = 0.5
-
-# Measured: fixed + 11.9 * basis_n + 380 * trees_per_tile. The basis belongs to the ensemble, not
-# the shard, so tree-split does not divide it -- and one multiplier would.
-_OBLIQUE_PER_TREE_TAX = 380.0 / 156.0
-_BASIS_CYC_PER_ENTRY = 11.9
 
 
 def _row_cycles(W, feat_bytes):
@@ -207,7 +225,8 @@ def _trees_per_tile_for(n_trees, n_tiles, split_axis):
 
 
 def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
-             priority, oblique=False, feed='plio', split_axis=None, basis_n=0):
+             priority, clock_ghz, oblique=False, feed='plio', split_axis=None,
+             basis_n=0):
     '''Forward estimate for one mapping
 
     split_axis is normally the priority's, because a priority IS a choice of axis. It is
@@ -225,48 +244,8 @@ def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
 
     return {'est_cyc_per_invocation': inv,
             'est_cyc_per_sample': inv / samples_per_inv,
-            'est_latency_ss_ns': 1.1 * inv / AIE_CLOCK_GHZ,
-            'est_throughput_ns_per_sample': inv / samples_per_inv / AIE_CLOCK_GHZ,
+            'est_latency_ss_ns': 1.1 * inv / clock_ghz,
+            'est_throughput_ns_per_sample': inv / samples_per_inv / clock_ghz,
             'trees_per_tile': trees_per_tile,
             'split_axis': split_axis,
             }
-
-
-def choose_n_tiles(n_trees, max_depth, n_features, W, feat_bytes, leaf_bytes, priority,
-                   max_tiles, tile_memory_bytes, oblique=False, basis_n=0):
-    '''Pick a tile count, and explain the choice. Returns (n_tiles, [notes])'''
-    notes = []
-    ceiling = max_tiles
-    auto_ceiling = min(ceiling, _AUTO_TILE_CEILING)
-
-    candidates = tile_candidates(ceiling)
-
-    if priority == 'throughput':
-        n = min(auto_ceiling, ceiling)
-        if ceiling > n:
-            notes.append(f'sample-split throughput scales linearly with tiles; stopping at '
-                         f'{n} to keep compile time down, raise n_tiles for more')
-        return n, notes
-
-    chosen = 1
-    for n in [c for c in candidates if c > 1]:
-        if n > auto_ceiling:
-            notes.append(f'stopping at {chosen} tiles: auto does not go past {auto_ceiling} '
-                         'to keep compile time down, raise n_tiles for lower latency')
-            break
-        here = estimate(n_trees, max_depth, n_features, chosen, W, feat_bytes, leaf_bytes,
-                        priority, oblique, basis_n=basis_n)['est_latency_ss_ns']
-        there = estimate(n_trees, max_depth, n_features, n, W, feat_bytes, leaf_bytes,
-                         priority, oblique, basis_n=basis_n)['est_latency_ss_ns']
-        if here - there < _MARGINAL_GAIN * here:
-            notes.append(f'stopping at {chosen} tiles: doubling to {n} buys '
-                         f'{100 * (here - there) / here:.1f}%, under the '
-                         f'{100 * _MARGINAL_GAIN:.0f}% threshold. Set n_tiles manually for '
-                         'lower latency')
-            break
-        chosen = n
-    else:
-        if chosen == ceiling:
-            notes.append(f'stopping at {chosen} tiles, the maximum available')
-
-    return chosen, notes
