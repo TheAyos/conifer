@@ -242,15 +242,15 @@ def test_cost_model_reproduces_the_measured_anchors():
 
 
 def test_priority_picks_opposite_split_axes():
-    lat = mapper.estimate(32, 4, 16, 8, 32, 2, 4, 'latency')
-    thr = mapper.estimate(32, 4, 16, 8, 32, 2, 4, 'throughput')
+    lat = mapper.estimate(32, 4, 16, 8, 32, 2, 4, 'latency', 1.25)
+    thr = mapper.estimate(32, 4, 16, 8, 32, 2, 4, 'throughput', 1.25)
     assert lat['split_axis'] == 'tree'
     assert thr['split_axis'] == 'sample'
     assert thr['est_throughput_ns_per_sample'] < lat['est_throughput_ns_per_sample']
 
 
 def test_auto_tiles_explains_where_it_stopped():
-    n, notes = mapper.choose_n_tiles(32, 4, 16, 32, 2, 4, 'latency', 112, 0x10000)
+    n, _, notes = mapper.choose_mapping(32, 4, 16, 2, 4, 'latency', 112, 1.25)
     assert 1 <= n <= 112
     assert any('n_tiles' in s for s in notes)
 
@@ -435,13 +435,20 @@ def test_each_priority_wins_its_own_metric(skl_model, tmp_path):
             < got['latency']['est_throughput_ns_per_sample'])
 
 
-def test_both_priorities_compile_the_same_batch(skl_model, tmp_path):
-    '''n_samples is a batch size, so two mappings of one model stay comparable'''
+def test_the_batch_is_a_whole_number_of_runs_near_the_target(skl_model, tmp_path):
+    '''n_samples is a batch size, held near one target so two mappings of a model stay
+    comparable. It cannot be the SAME number for both: a sample-split run is W samples on
+    every tile at once, and at W=64 on sixteen tiles that already exceeds the target.
+    '''
+    from conifer.backends.aie.writer import DEFAULT_BATCH
     clf, _ = skl_model
-    n = {p: conifer.converters.convert_from_sklearn(
-             clf, _config(tmp_path / p, Priority=p)).n_samples
-         for p in ('latency', 'throughput')}
-    assert n['latency'] == n['throughput']
+    for priority in ('latency', 'throughput'):
+        m = conifer.converters.convert_from_sklearn(
+            clf, _config(tmp_path / priority, Priority=priority))
+        step = m.W * (m.n_tiles if m.split_axis == 'sample' else 1)
+        assert m.n_samples % step == 0, 'a batch is a whole number of runs'
+        assert m.n_samples >= min(DEFAULT_BATCH, step)
+        assert m.n_samples < DEFAULT_BATCH + step, 'and the smallest one that clears it'
 
 
 def test_auto_uses_one_tile_ceiling_for_both_priorities(skl_model, tmp_path):
@@ -452,17 +459,136 @@ def test_auto_uses_one_tile_ceiling_for_both_priorities(skl_model, tmp_path):
     assert n['latency'] == n['throughput']
 
 
-def test_auto_picks_a_width_the_study_measured():
-    '''The cost model prices wider vectors but nothing on this device has measured them'''
-    for priority in ('latency', 'throughput'):
-        _, W, _ = mapper.choose_mapping(32, 4, 16, 2, 4, priority, 304, 0x10000)
-        assert W in mapper.AUTO_VECTOR_WIDTHS
+@pytest.mark.parametrize('max_depth,lat,thr', [(4, 32, 64), (5, 16, 32), (6, 8, 16)])
+def test_the_inner_loop_vector_fills_a_register(max_depth, lat, thr):
+    '''A lane costs one bitvector, so a deeper ensemble wants a narrower group to fill
+    the same register. Measured at int16 on one tile: depth 4 latency_ss is 4316 ns at
+    W=16 against 4292 at W=32, and depth 5 is 7979 against 10816 -- the winner flips
+    where the lane doubles, and each winner is the width that fills 512 bits.
+    '''
+    assert mapper.vector_width('latency', max_depth, 2) == lat
+    assert mapper.vector_width('throughput', max_depth, 2) == thr
+    for priority, expect in (('latency', lat), ('throughput', thr)):
+        _, W, _ = mapper.choose_mapping(32, max_depth, 16, 2, 4, priority, 304, 1.25)
+        assert W == expect, 'the cost model must not get a vote on W'
+
+
+def test_the_required_mode_is_the_one_the_tables_are_quantized_in():
+    """The backend refuses any ap_fixed mode but AP_RND_CONV,AP_SAT. The reason is not
+    that no other mode could ever agree -- AP_RND differs only at exact ties and AP_WRAP
+    only on overflow -- but that quantize() rounds half to even and saturates, so that
+    mode is the one describing the tables it emits. AP_TRN would truncate and does not.
+    """
+    p = Precision('ap_fixed<16,6,AP_RND_CONV,AP_SAT>')
+    half = (0.5 + np.arange(4)) / (1 << p.shift)          # exactly representable ties
+    assert list(p.quantize(half)) == [0, 2, 2, 4], 'ties go to even, not away from zero'
+    assert p.quantize([1e9])[0] == 2 ** 15 - 1, 'and the ends saturate rather than wrap'
+
+
+def test_reading_scores_can_pick_the_simulator(skl_model, tmp_path):
+    """decision_function must read its own x86 run even when an older build() left an
+    aiesimulator output behind, and asking for 'aie' must not fall back to the x86 one.
+    """
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path, NTiles=1))
+    model.write()
+    for d, val in (('build_x86/x86simulator_output', 16), ('build_hw/aiesimulator_output', 32)):
+        os.makedirs(tmp_path / d, exist_ok=True)
+        (tmp_path / d / 'scores.dat').write_text(f'{val}\n')
+    assert model.read_scores()[0] == model.score_p.dequantize([16])[0]
+    assert model.read_scores(simulator='aie')[0] == model.score_p.dequantize([32])[0]
+
+    # With no aiesimulator output, asking for it must raise rather than quietly hand
+    # back the x86 scores -- that would read as agreement between two runs of one thing.
+    shutil.rmtree(tmp_path / 'build_hw')
+    with pytest.raises(FileNotFoundError):
+        model.read_scores(simulator='aie')
+
+
+def test_the_io_cost_is_reported_not_left_to_be_inferred(tmp_path, monkeypatch):
+    """cyc_per_sample is the kernel's own time and throughput_ns_per_sample is the
+    period the array holds, so their difference is what it spends not computing.
+    Taken against the whole run instead, it counted the graph's fixed startup as I/O
+    and read as 56% of the wall clock on a design that is compute-bound.
+    """
+    from conifer.backends.aie import report as rpt
+    W, n_samples, ghz = 32, 512, 1.25
+    cores = [{'cyc': 7440, 'calls': n_samples // W, 'total': 17100}]
+    monkeypatch.setattr(rpt, '_cores', lambda d: cores)
+    # A period a shade longer than the kernel's own time: that shade is the I/O.
+    period = 7440 / (n_samples // W) / ghz + 10.0
+    with open(tmp_path / 'scores.dat', 'w') as f:
+        for g in range(n_samples // W):
+            for j in range(W):
+                f.write(f'T {g * period + j:g} ns\n0\n')
+
+    out = {}
+    rpt._build_metrics(str(tmp_path),
+                       {'config': {'n_tiles': 1, 'split_axis': 'tree', 'vector_width': W},
+                        'n_samples': n_samples, 'clock_ghz': ghz}, out)
+    assert out['io_ns_per_sample'] == pytest.approx(
+        out['throughput_ns_per_sample'] - out['cyc_per_sample'] / ghz)
+    assert out['io_ns_per_sample'] == pytest.approx(10.0 / W)
+
+
+def test_a_stump_is_a_model(skl_model, tmp_path):
+    """max_depth=1 is one node and two leaves -- classic boosting, and the cost table
+    only covered depths 2 to 6, so it raised a bare KeyError.
+    """
+    from sklearn.datasets import make_hastie_10_2
+    from sklearn.ensemble import GradientBoostingClassifier
+    X, y = make_hastie_10_2(n_samples=800, random_state=0)
+    clf = GradientBoostingClassifier(n_estimators=8, max_depth=1,
+                                     random_state=0).fit(X[:600], y[:600])
+    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path))
+    model.write()
+    assert model.tables.nodes_per_tree == 1 and model.tables.max_leaves == 2
+    assert model.estimate['est_cyc_per_sample'] > 0
+
+
+def test_sample_split_says_when_a_run_outgrows_the_target(skl_model, tmp_path):
+    """At W=64 on sixteen tiles a run is 1024 samples, over the 512 batch target, so the
+    batch has to grow and a short X will starve whole tiles. Both are worth saying.
+    """
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, Priority='throughput', NTiles=16, SplitAxis='sample'))
+    model.write()
+    assert model.n_samples == model.W * 16
+    assert any('one run is' in n and 'nothing but padding' in n for n in model.notes)
+
+
+def test_a_short_batch_names_the_tiles_that_get_only_padding(
+        skl_model, tmp_path, caplog, monkeypatch):
+    """Groups are dealt to tiles in turn, so a short X does not pad them evenly."""
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, Priority='throughput', NTiles=8, SplitAxis='sample'))
+    model.write()
+    # The message is logged before the simulator runs, so stub it out and keep this
+    # test toolchain-free like the rest of the file.
+    from conifer.backends.aie import tools
+    monkeypatch.setattr(type(model), 'platform', lambda self: '/none.xpfm')
+    monkeypatch.setattr(tools, 'run_make', lambda *a, **k: False)
+    with caplog.at_level('INFO'):
+        model.decision_function(np.zeros((model.W, model.n_features)))
+    assert '7 of the 8 tiles score only padding' in caplog.text
+
+
+def test_the_widest_lane_wins_not_the_bitvector_alone():
+    '''Precision is the other candidate: a 32-bit compare binds where a 16-bit one does
+    not, at the depths whose bitvector is narrower than it.
+    '''
+    assert mapper.lane_bits(4, 2) == 16 and mapper.lane_bits(4, 4) == 32
+    assert mapper.vector_width('latency', 4, 4) == 16      # compare binds
+    assert mapper.lane_bits(6, 2) == 64 and mapper.lane_bits(6, 4) == 64
+    assert mapper.vector_width('latency', 6, 4) == 8       # bitvector still binds
 
 
 def test_latency_prefers_a_narrower_vector_than_throughput():
     '''A narrower vector is a smaller invocation; a wider one amortises it over more'''
-    _, w_lat, _ = mapper.choose_mapping(32, 4, 16, 2, 4, 'latency', 304, 0x10000)
-    _, w_thr, _ = mapper.choose_mapping(32, 4, 16, 2, 4, 'throughput', 304, 0x10000)
+    _, w_lat, _ = mapper.choose_mapping(32, 4, 16, 2, 4, 'latency', 304, 1.25)
+    _, w_thr, _ = mapper.choose_mapping(32, 4, 16, 2, 4, 'throughput', 304, 1.25)
     assert w_lat < w_thr
 
 
@@ -703,13 +829,13 @@ def test_a_failed_run_names_its_log_and_the_first_error(tmp_path, monkeypatch):
     log = tmp_path / 'x86sim_build.log'
     monkeypatch.setattr(tools, 'require_tools', lambda *a: None)
 
-    def fail(cmd):
-        log.write_text('INFO: compiling\n'
-                       '../src/params.h:99:15: error: static assertion failed\n'
-                       'ERROR: [aiecompiler 77-753] cannot recover\n')
-        return 512
+    def fail(cmd, shell=None, stdout=None, stderr=None):
+        stdout.write('INFO: compiling\n'
+                     '../src/params.h:99:15: error: static assertion failed\n'
+                     'ERROR: [aiecompiler 77-753] cannot recover\n')
+        return 2
 
-    monkeypatch.setattr(tools.os, 'system', fail)
+    monkeypatch.setattr(tools.subprocess, 'call', fail)
     lines = _capture_logger(monkeypatch, tools)
 
     assert tools.run_make(str(tmp_path), 'x86sim_build') is False
@@ -718,10 +844,57 @@ def test_a_failed_run_names_its_log_and_the_first_error(tmp_path, monkeypatch):
     assert 'static assertion failed' in errors[0], 'the first error, not the last'
 
 
+def test_a_run_killed_by_a_signal_is_a_failure_not_a_success(tmp_path, monkeypatch):
+    """subprocess reports a signal death as a negative return code, so testing the
+    result for > 0 -- what os.system needed -- would call a killed build a success.
+    """
+    from conifer.backends.aie import tools
+    monkeypatch.setattr(tools, 'require_tools', lambda *a: None)
+    monkeypatch.setattr(tools.subprocess, 'call', lambda cmd, **kw: -9)
+    _capture_logger(monkeypatch, tools)
+
+    assert tools.run_make(str(tmp_path), 'aiesim') is False
+
+
+def test_an_interrupt_stops_the_run_rather_than_reading_as_a_failed_build(
+        tmp_path, monkeypatch):
+    """os.system ignores SIGINT for the child's lifetime, so a Ctrl-C during a build
+    that runs for minutes came back as a toolchain failure with an empty log.
+    """
+    from conifer.backends.aie import tools
+
+    def interrupted(cmd, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tools, 'require_tools', lambda *a: None)
+    monkeypatch.setattr(tools.subprocess, 'call', interrupted)
+    lines = _capture_logger(monkeypatch, tools)
+
+    with pytest.raises(KeyboardInterrupt):
+        tools.run_make(str(tmp_path), 'aiesim')
+    assert not [m for lvl, m in lines if lvl == 'error']
+
+
+def test_a_clean_tally_is_not_read_as_an_error(tmp_path):
+    """The tools finish with "(WARNING:3, CRITICAL-WARNING:0, ERROR:0)", which contains
+    the word and reports none. Quoting it as the first error hides the real one.
+    """
+    from conifer.backends.aie.tools import _first_error
+    log = tmp_path / 'aiesim.log'
+    log.write_text('Compilation finished successfully (0 errors, 1 warnings)\n'
+                   '(WARNING:3, CRITICAL-WARNING:0, ERROR:0)\n'
+                   'ERROR: [aiecompiler 77-753] cannot recover\n')
+    assert _first_error(str(log)) == 'ERROR: [aiecompiler 77-753] cannot recover'
+
+    log.write_text('(WARNING:3, CRITICAL-WARNING:0, ERROR:0)\nall good\n')
+    assert _first_error(str(log)) is None
+
+
 def test_a_successful_run_still_says_where_the_log_is(tmp_path, monkeypatch):
     from conifer.backends.aie import tools
     monkeypatch.setattr(tools, 'require_tools', lambda *a: None)
-    monkeypatch.setattr(tools.os, 'system', lambda cmd: 0)
+    monkeypatch.setattr(tools.subprocess, 'call',
+                        lambda cmd, **kw: 0)
     lines = _capture_logger(monkeypatch, tools)
 
     assert tools.run_make(str(tmp_path), 'aiesim') is True
@@ -762,6 +935,106 @@ def test_cyc_per_sample_is_the_arrays_cost_on_both_axes(monkeypatch):
         assert out['cyc_per_sample'] == pytest.approx(12000 / 512), axis
 
 
+def test_throughput_is_the_period_the_array_holds_not_the_whole_run(tmp_path, monkeypatch):
+    """total_cycle_count exceeds the kernel's own time by a fixed graph startup and
+    teardown -- 7300 to 9600 cycles whatever the model -- so dividing it by the sample
+    count reports that constant. It read 26.72 ns/sample where the array held a 387 ns
+    period over 32 samples, and the same build's estimate said 10.95.
+    """
+    from conifer.backends.aie import report as rpt
+    W, n_tiles, n_samples, ghz = 32, 4, 128, 1.25
+    period, kernel_cyc, startup = 400.0, 8 * 1024, 8000
+
+    monkeypatch.setattr(rpt, '_cores', lambda d: [
+        {'col': i, 'row': 0, 'name': f'bdt_qs_tile_{i}', 'calls': n_samples // W,
+         'cyc': kernel_cyc, 'total': kernel_cyc + startup} for i in range(n_tiles)])
+    # Groups of W scores, one period apart, the way a PLIO port writes them.
+    with open(tmp_path / 'scores.dat', 'w') as f:
+        for g in range(n_samples // W):
+            for j in range(W):
+                f.write(f'T {g * period + j:g} ns\n0\n')
+
+    out = {}
+    rpt._build_metrics(str(tmp_path), {'config': {'n_tiles': n_tiles, 'split_axis': 'tree',
+                                                  'vector_width': W},
+                                       'n_samples': n_samples, 'clock_ghz': ghz}, out)
+    assert out['throughput_ns_per_sample'] == pytest.approx(period / W)
+    assert out['run_ns_per_sample'] == pytest.approx((kernel_cyc + startup) / ghz / n_samples)
+    assert out['run_ns_per_sample'] > 3 * out['throughput_ns_per_sample'], \
+        'the whole run is the number that used to be reported'
+
+    # A sample-split invocation retires W on each tile, which is what the estimate
+    # divides by as well.
+    out = {}
+    rpt._build_metrics(str(tmp_path), {'config': {'n_tiles': n_tiles, 'split_axis': 'sample',
+                                                  'vector_width': W},
+                                       'n_samples': n_samples, 'clock_ghz': ghz}, out)
+    assert out['throughput_ns_per_sample'] == pytest.approx(period / (W * n_tiles))
+
+
+def test_build_names_the_rows_it_scores_rather_than_inheriting_them(skl_model, tmp_path,
+                                                                   monkeypatch):
+    """build() ran the simulator on whatever data/x.dat held, so its result depended on
+    what the last decision_function() left there -- and decision_function leaves its
+    LAST batch. Both examples carried a write_input call to work around it.
+    """
+    from conifer.backends.aie import tools
+    clf, X = skl_model
+    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path))
+    ran = []
+    monkeypatch.setattr(tools, 'run_make',
+                        lambda out, target, **kw: ran.append(target) or True)
+    monkeypatch.setattr(type(model), 'platform', lambda self: 'x.xpfm')
+
+    model.build(X[:8])
+    assert ran == ['aiesim']
+    first = open(tmp_path / 'data' / 'x.dat').read()
+
+    # The rows are an argument now, so a later build with different ones is not a
+    # question of what happened to be on disk.
+    ran.clear()
+    model.build(X[8:16])
+    assert open(tmp_path / 'data' / 'x.dat').read() != first
+
+    # Stopping after the hardware compile skips the simulator, which is the longer half.
+    ran.clear()
+    model.build(simulate=False)
+    assert ran == ['hw_build']
+
+    with pytest.raises(ValueError):
+        model.build(X[:8], simulate=False)
+
+
+def test_the_makefile_splits_the_hardware_compile_from_the_simulator(skl_model, tmp_path):
+    """aiesimulator is roughly twice the hardware compile, and a user asking only what
+    the design costs should not pay for it. The x86 pair was already split this way.
+    """
+    clf, _ = skl_model
+    conifer.converters.convert_from_sklearn(clf, _config(tmp_path)).write()
+    makefile = (tmp_path / 'Makefile').read_text()
+    assert 'hw_build: check-platform' in makefile
+    assert 'aiesim: hw_build' in makefile, 'the simulator must still get a compiled graph'
+    body = makefile.split('aiesim: hw_build')[1].split('\n\n')[0]
+    assert 'aiecompiler' not in body, 'the compile belongs to hw_build now'
+
+
+def test_no_vendored_kernel_points_at_the_study_that_produced_it():
+    """The kernels were vendored from a research tree that built them standalone, and
+    two graphs kept its stimulus path as an #ifndef fallback. parameters.h always
+    defines XIN_FILE, so the fallback was dead - but a dead default that names a
+    directory no conifer user has is a trap waiting for the day it is not dead.
+    """
+    import glob
+    firmware = os.path.join(os.path.dirname(conifer.backends.aie.__file__), 'firmware')
+    for path in glob.glob(os.path.join(firmware, '**', '*'), recursive=True):
+        if not os.path.isfile(path):
+            continue
+        with open(path, errors='ignore') as f:
+            text = f.read()
+        for residue in ('gen/out', 'xin_file.h', 'X_fm_'):
+            assert residue not in text, f'{os.path.basename(path)} still names {residue}'
+
+
 def test_every_macro_the_ladder_emits_is_defined_in_the_firmware():
     """The generator names macros the kernels define, and nothing checks that pairing.
 
@@ -783,6 +1056,58 @@ def test_every_macro_the_ladder_emits_is_defined_in_the_firmware():
         decl, defn, _ = roles.ladder(n_tiles, 'tree', 'plio')
         emitted |= {line.split('(')[0] for line in decl + defn}
     assert emitted and emitted <= defined, emitted - defined
+
+
+def test_a_new_mapping_does_not_build_on_the_old_ones_work(skl_model, tmp_path):
+    """aiecompiler reuses <target>/Work, so a project directory written twice for two
+    different mappings simulates a mixture of them: the cores the new mapping compiles
+    are new, and the rest keep the ELF the old one left. It failed the oblique example
+    on a stack the current kernel fits inside, reported against cores that were four
+    hours old.
+    """
+    clf, _ = skl_model
+    model = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, Priority='latency'))
+    model.write()
+
+    work = tmp_path / 'build_x86' / 'Work' / 'aie' / '11_0'
+    work.mkdir(parents=True)
+    (work / 'stale.elf').write_text('an earlier mapping')
+
+    model.write()
+    assert work.exists(), 'the same sources: the build is still the right one'
+
+    other = conifer.converters.convert_from_sklearn(
+        clf, _config(tmp_path, Priority='throughput'))
+    other.write()
+    assert not (tmp_path / 'build_x86').exists(), \
+        'a different mapping: the old Work must not survive'
+
+
+def test_the_graph_allots_what_the_mapper_reports():
+    """table_bytes is what a user is shown and stack_size is what the tile gets, and
+    nothing paired them: ((X + n * KIB - 1) / KIB) * KIB reads like "X plus n KiB,
+    rounded" and gives one KiB less, so the report promised more than the allotment.
+    """
+    import re
+    firmware = os.path.join(os.path.dirname(conifer.backends.aie.__file__), 'firmware')
+
+    def alloted(family, **names):
+        with open(os.path.join(firmware, family, 'graph.hpp')) as f:
+            text = f.read()
+        out = {}
+        for kind in ('heap', 'stack'):
+            expr = re.search(rf'{kind}_size\(kk\) = ([^;]+);', text).group(1)
+            out[kind] = eval(expr.replace('/', '//'), {}, dict(KIB=1024, **names))
+        return out
+
+    # TABLES is everything the heap holds; XBYTES is the x buffer the kernel puts on
+    # the stack, which is the mapper's stack term before the margin.
+    b = mapper.table_bytes(n_trees=32, max_depth=4, max_leaves=16, n_features=16,
+                           W=32, feat_bytes=2, leaf_bytes=4, oblique=False)
+    tables = sum(v for k, v in b.items() if k not in ('heap', 'stack', 'total'))
+    got = alloted('axis', TABLES=tables, XBYTES=16 * 32 * 2)
+    assert (got['heap'], got['stack']) == (b['heap'], b['stack']), (got, b)
 
 
 def test_the_search_space_follows_the_device_not_the_old_ladder():
@@ -861,7 +1186,8 @@ def test_oblique_estimate_carries_the_measured_tax(ydf_model, tmp_path):
     model = conifer.converters.convert_from_ydf(ymodel, _oblique_config(tmp_path))
     axis = mapper.estimate(model.tables.n_trees, model.tables.max_depth,
                            model.n_features_padded, model.n_tiles, model.W, 2, 4,
-                           'latency', split_axis=model.split_axis)
+                           'latency', model.device['clock_ghz'],
+                           split_axis=model.split_axis)
     assert (model.estimate['est_cyc_per_sample']
             > 2 * axis['est_cyc_per_sample']), 'oblique must not be priced as axis-aligned'
 

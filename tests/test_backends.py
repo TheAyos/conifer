@@ -79,3 +79,66 @@ def test_py_backend():
    y_skl = clf.decision_function(X)
    y_cnf = model.decision_function(X)
    np.testing.assert_allclose(y_skl, y_cnf, rtol=1e-6, atol=1e-6)
+
+# AI Engine backend tests
+# compile() runs aiecompiler and decision_function() runs x86simulator, so these fail
+# without the Vitis AI Engine tools
+
+# TODO: quantize() at precision.py add support for other types
+aie_precision = {'Precision': 'ap_fixed<16,6,AP_RND_CONV,AP_SAT>',
+                 'ScorePrecision': 'ap_fixed<32,16,AP_RND_CONV,AP_SAT>'}
+
+# small, each configuration costs one aiecompiler run and one simulator run
+aie_rows = 64
+
+def f_train_ydf_oblique():
+  ydf = pytest.importorskip('ydf')
+  from sklearn.datasets import make_hastie_10_2
+  X, y = make_hastie_10_2(random_state=0)
+  model = ydf.GradientBoostedTreesLearner(
+      num_trees=20, max_depth=3, split_axis='SPARSE_OBLIQUE',
+      sparse_oblique_weights='BINARY',   # the only weights the kernel supports
+      apply_link_function=False, label='y',
+  ).train({'x': X[:2000], 'y': y[:2000] == 1}, verbose=0)
+  return model, X[2000:2000 + aie_rows]
+
+def aie_and_cpp(convert, model, X, odir, overrides):
+  ys = []
+  for backend in ('aie', 'cpp'):
+    cfg = conifer.backends.get_backend(backend).auto_config()
+    cfg.update(aie_precision)
+    cfg['OutputDir'] = f'{odir}_{backend}'
+    if backend == 'aie':
+      cfg.update(overrides)
+    m = convert(model, cfg)
+    m.compile()
+    ys.append(np.asarray(m.decision_function(X)).ravel())
+  return ys
+
+aie_axis_configs = [
+    pytest.param({'NTiles': 1, 'SplitAxis': 'tree', 'NSamples': aie_rows}, id='one_tile'),
+    pytest.param({'NTiles': 4, 'SplitAxis': 'tree', 'NSamples': aie_rows}, id='tree_split_4'),
+    pytest.param({'NTiles': 4, 'SplitAxis': 'sample', 'NSamples': aie_rows}, id='sample_split_4'),
+]
+
+@pytest.mark.parametrize('overrides', aie_axis_configs)
+def test_aie_axis_matches_cpp(overrides):
+  clf, X, _ = model0
+  stamp = int(datetime.datetime.now().timestamp())
+  y_aie, y_cpp = aie_and_cpp(conifer.converters.convert_from_sklearn, clf, X[:aie_rows],
+                             f'prj_aie_axis_{stamp}', overrides)
+  np.testing.assert_array_equal(y_aie, y_cpp)
+
+aie_oblique_configs = [
+    pytest.param({'NTiles': 1, 'SplitAxis': 'tree', 'NSamples': aie_rows}, id='one_tile'),
+    pytest.param({'NTiles': 4, 'SplitAxis': 'tree', 'NSamples': aie_rows}, id='tree_split_4'),
+    pytest.param({'NTiles': 4, 'SplitAxis': 'sample', 'NSamples': aie_rows}, id='sample_split_4'),
+]
+
+@pytest.mark.parametrize('overrides', aie_oblique_configs)
+def test_aie_oblique_matches_cpp(overrides):
+  model, X = f_train_ydf_oblique()
+  stamp = int(datetime.datetime.now().timestamp())
+  y_aie, y_cpp = aie_and_cpp(conifer.converters.convert_from_ydf, model, X,
+                             f'prj_aie_oblique_{stamp}', overrides)
+  np.testing.assert_array_equal(y_aie, y_cpp)
