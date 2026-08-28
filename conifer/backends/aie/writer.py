@@ -29,12 +29,10 @@ _DEFAULT_SCORE = 'ap_fixed<32,16,AP_RND_CONV,AP_SAT>'
 class AIEConfig(MultiPrecisionConfig):
     backend = 'aie'
     _config_fields = MultiPrecisionConfig._config_fields + [
-        'priority', 'max_ns_per_sample', 'max_latency_ns',
+        'priority',
         'n_tiles', 'split_axis', 'vector_width', 'tau', 'n_samples',
         'shard', 'feed', 'plio_rate', 'xilinx_part', 'platform', 'elfgen_jobs']
     _aie_alts = {'priority': ['Priority'],
-                 'max_ns_per_sample': ['MaxNsPerSample'],
-                 'max_latency_ns': ['MaxLatencyNs'],
                  'n_tiles': ['NTiles'],
                  'split_axis': ['SplitAxis'],
                  'vector_width': ['VectorWidth', 'W'],
@@ -55,8 +53,6 @@ class AIEConfig(MultiPrecisionConfig):
                      # instead of a preference between them. Both None means the
                      # priority knob decides, which is every configuration written
                      # before these existed.
-                     'max_ns_per_sample': None,
-                     'max_latency_ns': None,
                      'n_tiles': AUTO,
                      'split_axis': AUTO,
                      'vector_width': AUTO,
@@ -71,7 +67,7 @@ class AIEConfig(MultiPrecisionConfig):
                      }
     _defaults = {**MultiPrecisionConfig._defaults, **_aie_defaults}
     _allow_undefined = [*MultiPrecisionConfig._allow_undefined] + [
-        'platform', 'elfgen_jobs', 'max_ns_per_sample', 'max_latency_ns']
+        'platform', 'elfgen_jobs']
 
     def __init__(self, configDict, validate=True):
         super(AIEConfig, self).__init__(configDict, validate=False)
@@ -101,11 +97,6 @@ class AIEConfig(MultiPrecisionConfig):
         if self.priority not in ('latency', 'throughput'):
             raise ValueError(f"priority must be 'latency' or 'throughput', got "
                              f"'{self.priority}'")
-        for k in ('max_ns_per_sample', 'max_latency_ns'):
-            v = getattr(self, k, None)
-            if v is not None and not (isinstance(v, (int, float)) and v > 0):
-                raise ValueError(f"{k} must be a positive number of nanoseconds, "
-                                 f"got '{v}'")
         if self.shard not in (AUTO, 'fast', True, False, 'false', 'off'):
             raise ValueError(f"shard must be '{AUTO}', 'fast' or False, got "
                              f"'{self.shard}'")
@@ -238,32 +229,8 @@ class AIEModel(ModelBase):
         self._notes = []
 
         self.priority = cfg.priority
-        # THE LONG FORM, when the user states a requirement instead of a preference.
-        # A rate that must be held and a latency that must be met are what a trigger
-        # actually has; `priority` is a proxy for them. Given either, the SPLIT AXIS
-        # stops being an input -- tree-split is what a latency budget buys and
-        # sample-split is what a rate buys, so which one serves the pair is an answer.
-        want = (getattr(cfg, 'max_ns_per_sample', None),
-                getattr(cfg, 'max_latency_ns', None))
         self.split_axis = (('tree' if self.priority == 'latency' else 'sample')
                            if cfg.split_axis == AUTO else cfg.split_axis)
-        if any(v is not None for v in want) and cfg.split_axis == AUTO:
-            n, W, axis, notes = mapper.meet_requirement(
-                self.tables.n_trees, d, self.n_features_padded,
-                self.threshold_p.n_bytes, self.score_p.n_bytes,
-                self.device['n_tiles'], self.device['tile_memory_bytes'],
-                max_ns_per_sample=want[0], max_latency_ns=want[1],
-                oblique=self.oblique,
-                feed='plio' if cfg.feed == 'plio' else 'memtile',
-                n_tiles=None if cfg.n_tiles == AUTO else int(cfg.n_tiles),
-                W=None if cfg.vector_width == AUTO else int(cfg.vector_width))
-            self.split_axis = axis
-            self.n_tiles, self.W, self._notes = n, W, notes
-            checks.check_vector_width(self.W, self.threshold_p.n_bytes)
-            checks.check_n_tiles(self.n_tiles, self.oblique, self.device['n_tiles'],
-                                 self.device.get('plio_channels_out'))
-            self._finish_mapping(cfg)
-            return
         want_feed = 'plio' if cfg.feed == 'plio' else 'memtile'
         feed = want_feed if self.split_axis == 'tree' else 'plio'
         n, W, notes = mapper.choose_mapping(

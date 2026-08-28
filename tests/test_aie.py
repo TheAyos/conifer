@@ -609,82 +609,6 @@ def test_decision_function_matches_a_reference_backend_exactly(skl_model, tmp_pa
 
 
 # --------------------------------------------------------------------------- #
-# The long form: a required rate and a latency budget instead of a priority
-# --------------------------------------------------------------------------- #
-
-def test_a_requirement_picks_the_axis_rather_than_taking_it():
-    """A rate wants sample-split and a latency budget wants tree-split.
-
-    `priority` is a proxy for a requirement; given the requirement itself, which axis
-    serves it is an answer. So the two requirements, asked alone, must come back on
-    opposite axes -- which is the same fact `test_priority_picks_opposite_split_axes`
-    pins from the other end.
-    """
-    common = dict(max_tiles=64, tile_memory_bytes=65536)
-    _, _, ax_lat, _ = mapper.meet_requirement(100, 4, 16, 2, 2,
-                                              max_latency_ns=900.0, **common)
-    _, _, ax_rate, _ = mapper.meet_requirement(100, 4, 16, 2, 2,
-                                               max_ns_per_sample=20.0, **common)
-    assert ax_lat == 'tree' and ax_rate == 'sample', (ax_lat, ax_rate)
-
-
-def test_a_requirement_returns_the_smallest_mapping_that_meets_it():
-    """A requirement is a floor, not an objective.
-
-    Once two mappings both meet it, the one that spends less silicon is the answer;
-    beating a requirement nobody stated is how a mapper recommends sixty-four tiles for
-    a model that fits on four.
-    """
-    n, W, axis, _ = mapper.meet_requirement(32, 4, 16, 2, 2, max_tiles=64,
-                                            tile_memory_bytes=65536,
-                                            max_latency_ns=4000.0)
-    smaller = mapper.estimate(32, 4, 16, max(1, n // 2), W, 2, 2, 'latency',
-                              split_axis=axis)
-    assert smaller['est_latency_ss_ns'] > 4000.0, (n, smaller)
-
-
-def test_a_requirement_out_of_reach_says_which_half_failed():
-    """Refusing is the answer; refusing without saying why is not.
-
-    Two failures look alike and call for different fixes: a requirement no mapping
-    meets on its own, and a PAIR that no single mapping meets because the two halves
-    want opposite axes.
-    """
-    with pytest.raises(ValueError, match='no mapping in range'):
-        mapper.meet_requirement(100, 4, 16, 2, 2, max_tiles=64,
-                                tile_memory_bytes=65536, max_ns_per_sample=0.01)
-    with pytest.raises(ValueError, match='no single mapping meets BOTH'):
-        mapper.meet_requirement(100, 4, 16, 2, 2, max_tiles=64,
-                                tile_memory_bytes=65536,
-                                max_ns_per_sample=10.0, max_latency_ns=3000.0)
-
-
-def test_a_requirement_needs_at_least_one_requirement():
-    with pytest.raises(ValueError, match='needs a rate'):
-        mapper.meet_requirement(32, 4, 16, 2, 2, max_tiles=64,
-                                tile_memory_bytes=65536)
-
-
-def test_the_requirement_reaches_the_model_and_moves_the_mapping(skl_model, tmp_path):
-    """The knob is only shipped if a user can reach it from the config."""
-    clf, _ = skl_model
-    model = conifer.converters.convert_from_sklearn(
-        clf, _config(tmp_path, MaxNsPerSample=60.0, MaxLatencyNs=2000.0))
-    assert model.estimate['est_throughput_ns_per_sample'] <= 60.0
-    assert model.estimate['est_latency_ss_ns'] <= 2000.0
-    # The estimate must describe the graph that is being BUILT, not the one the
-    # priority would have implied.
-    assert model.estimate['split_axis'] == model.split_axis
-    assert any('meets the requirement' in n for n in model._notes)
-
-
-def test_a_requirement_is_validated_like_any_other_field(skl_model, tmp_path):
-    clf, _ = skl_model
-    with pytest.raises(ValueError, match='positive number of nanoseconds'):
-        conifer.converters.convert_from_sklearn(clf, _config(tmp_path, MaxLatencyNs=-5))
-
-
-# --------------------------------------------------------------------------- #
 # The per-tile role ladder
 # --------------------------------------------------------------------------- #
 
@@ -830,16 +754,9 @@ def test_every_macro_the_ladder_emits_is_defined_in_the_firmware():
 
 
 def test_the_search_space_follows_the_device_not_the_old_ladder():
-    """The ladder is generated per project, so nothing stops the search at 64 tiles.
-
-    A rate that no 64-tile mapping meets must come back on more than 64, not as
-    'no mapping in range' -- which is what a hardcoded candidate list would say.
-    """
+    """The ladder is generated per project, so nothing stops the search at 64 tiles"""
     assert mapper.tile_candidates(304) == [1, 2, 4, 8, 16, 32, 64, 128, 256]
-    n, _, axis, _ = mapper.meet_requirement(200, 4, 16, 2, 2, max_tiles=304,
-                                            tile_memory_bytes=65536,
-                                            max_ns_per_sample=8.0)
-    assert n > 64 and axis == 'sample', (n, axis)
+    assert mapper.tile_candidates(112)[-1] == 64, 'the shim bound still caps it'
 
 
 # ----- things the phase 6.1 sweep caught -----
