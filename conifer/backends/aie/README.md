@@ -191,6 +191,10 @@ study's width sweep - depths 4 to 6 at widths 8 to 32 - within 9%, and both tile
 anchors exactly. It is still an estimate, not a measurement: use `build()` for real
 numbers.
 
-The oblique estimate is the weaker half. Its basis term is priced flat per entry from a
-`W=32` measurement, and that term is cheaper at narrower vectors, so an oblique estimate
-runs high at small `W` - about 8% on a `W=8` build.
+Two arms are weaker than the rest, both at narrow vectors. At `W=8` the fixed term is
+under-predicted, so an axis-aligned estimate runs **optimistic** - 16% on cyc/sample and
+14% on latency for the example above - and a latency mapping is where auto picks a narrow
+vector. The oblique basis term is priced flat per entry from a `W=32` measurement and is
+cheaper at narrower vectors, so an oblique estimate runs **high** at small `W`, about 8%.
+Both are sizing errors, not correctness ones: `build()` is where reported numbers come
+from.
