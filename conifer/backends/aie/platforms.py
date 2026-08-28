@@ -3,8 +3,7 @@ import glob
 import logging
 logger = logging.getLogger(__name__)
 
-# Where a Vitis install keeps its base platforms, relative to the install root. The
-# layout moved between releases, so both are searched.
+# Where a Vitis install keeps its base platforms
 _PLATFORM_SUBDIRS = ('base_platforms', 'platforms')
 
 
@@ -32,9 +31,7 @@ def platform_search_paths():
 
 def find_platform(name):
     '''Absolute path of a platform's .xpfm, or None
-
-    A release names the same platform two ways - 'vek280_base' and
-    'xilinx_vek280_base_202610_1' - so the bare name is matched as a prefix too.
+        e.g. 'vek280_base', 'xilinx_vek280_base_202610_1'
     '''
     if name and name.endswith('.xpfm'):
         return os.path.abspath(name) if os.path.exists(name) else None
@@ -46,9 +43,8 @@ def find_platform(name):
         hits.extend(glob.glob(os.path.join(base, f'*{name}*', '*.xpfm')))
     if not hits:
         return None
-    # Prefer an exact directory name over a versioned alias, then take the newest.
     exact = [h for h in hits if os.path.basename(h) == f'{name}.xpfm']
-    return sorted(exact or hits)[-1]
+    return max(exact or hits)
 
 
 def resolve_platform(name):

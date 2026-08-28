@@ -193,8 +193,11 @@ class AIEModel(ModelBase):
     def _resolve_plio_rate(self):
         '''Offered PLIO rate in MHz'''
         cfg, dev = self.config, self.device
+        # float in both branches: the device record holds an int, and a project
+        # written from resolved_config() must emit the same text as the one it came
+        # from -- 625 against 625.0 is a difference nothing else would explain.
         if cfg.plio_rate == AUTO:
-            return dev.get('plio_rate_mhz', 625)
+            return float(dev.get('plio_rate_mhz', 625))
         rate = float(cfg.plio_rate)
         # A PLIO runs at most half the AI Engine array clock.
         ceiling = 1000.0 * dev['clock_ghz'] / 2

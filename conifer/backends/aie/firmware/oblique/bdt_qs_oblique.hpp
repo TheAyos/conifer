@@ -16,8 +16,6 @@ constexpr unsigned BV_WORDS = (bdtm::MAX_LEAVES + BV_BITS - 1) / BV_BITS;
 
 using vbvw = aie::vector<bvw_t, W>;
 
-// Word q of a bitvector, at compile time. The argument widens to uint64
-// whatever bv_t is, so the shift is defined at every depth.
 constexpr bvw_t bv_word(uint64_t v, unsigned q) {
   return (bvw_t)((v >> (BV_BITS * q)) & (bvw_t) ~(bvw_t)0);
 }
@@ -84,8 +82,7 @@ __attribute__((always_inline)) inline vleaf mux(const vrow &row,
   constexpr unsigned BIT = log2_of(N) - 1;
   if constexpr (N == 2) {
     // The bottom level takes its two candidates as elements of a vector already
-    // in a register, so the pair collapses to one vector with no scalar load at
-    // all.
+    // in a register, so the pair collapses to one vector, avoiding scalar load
     return aie::select(row[Lo], row[Lo + 1], mbit[BIT]);
   } else {
     const vleaf lo = mux<Lo, N / 2>(row, mbit);
@@ -109,8 +106,8 @@ __attribute__((always_inline)) inline vleaf leaf_value(const vbvw v[BV_WORDS],
     const vmask lower_wins = aie::neq(v[q], (bvw_t)0);
     lsb = aie::select(lsb, lsbq, lower_wins);
   }
-  // Which word won, as index bits above the in-word ones. With BV_WORDS == 2
-  // this is a single bit: set iff word 0 was empty.
+  // Which word won, as index bits above the in-word ones. With BV_WORDS at 2,
+  // this is a single bit that is set iff word 0 was empty.
 #pragma unroll
   for (unsigned p = 0; p + IN_WORD_BITS < log2_leaves(); p++) {
     vmask m = aie::eq(v[0], (bvw_t)0); // only the two-word case is reachable
@@ -144,14 +141,13 @@ constexpr unsigned QT_LANES =
 
 constexpr unsigned QT_HALVES = (QT_LANES * BV_BITS > 1024u) ? 2u : 1u;
 constexpr unsigned QT_CHUNK = QT_LANES / QT_HALVES;
-// The basis kernel has no chunked node loop. conifer's writer refuses the
-// shapes that would need one before emitting a project; this is the same
-// refusal, one level down.
+// The basis kernel has no chunked node loop. conifer's writer should refuse
+// the shapes that would need one before emitting a project
 static_assert(QT_HALVES == 1, "the basis kernel has no chunked node loop");
 
 static_assert(QT_CHUNK * BV_BITS <= 1024,
               "one chunk of a tree's bitvector run still exceeds a single "
-              "aie::vector; raise QT_HALVES");
+              "aie::vector");
 
 inline constexpr std::array<int16_t, QT_N + QT_LANES> QT_THR_P = [] {
   std::array<int16_t, QT_N + QT_LANES> a{};
@@ -174,7 +170,7 @@ inline constexpr std::array<bvw_t, BV_WORDS * QT_STRIDE> QT_BV_P = [] {
 
 static_assert((bdtm::N_FEATURES & (bdtm::N_FEATURES - 1)) == 0,
               "the weight row is loaded as one aie::vector, which needs a "
-              "power-of-two lane count; N_FEATURES is not one");
+              "power-of-two lane count, N_FEATURES is not one");
 
 inline void build_basis(const vfeat *x, vfeat *basis) {
   for (unsigned b = 0; b < bdtm::BASIS_N; b++) {
@@ -187,14 +183,12 @@ inline void build_basis(const vfeat *x, vfeat *basis) {
 }
 
 constexpr unsigned TERM_LANES = 64;
-static_assert(
-    bdtm::QS_NODES_PER_TREE * bdtm::MAX_TERMS <= TERM_LANES,
-    "one tree's term block no longer fits a single vector load; either "
-    "chunk it the way QT_HALVES chunks the node tables, or widen this");
+static_assert(bdtm::QS_NODES_PER_TREE * bdtm::MAX_TERMS <= TERM_LANES,
+              "one tree's term block no longer fits a single vector load");
 
-// The tree range is a template parameter so a tile scores only its own shard.
-// The basis itself is NOT subsetted: it is built over the whole feature set on
-// every tile, which is the term tree-split does not divide.
+// The tree range is a template parameter so a tile scores only its own shard
+// The basis itself is not subsetted, it's built over the whole feature set on
+// every tile
 template <unsigned T_BEGIN, unsigned T_COUNT, bool ADD_INIT, typename LoadRow>
 __attribute__((always_inline)) inline vscore qs_score_group(LoadRow load_row) {
   static_assert(T_BEGIN + T_COUNT <= bdtm::N_TREES,
@@ -209,8 +203,7 @@ __attribute__((always_inline)) inline vscore qs_score_group(LoadRow load_row) {
 
   const vbvw keep_all = aie::broadcast<bvw_t, W>(~(bvw_t)0);
   vacc acc;
-  // The ensemble's base score belongs to exactly one tile; added per shard it
-  // would be counted N times, silently and independently of shape.
+  // The ensemble's base score is added on exactly one tile
   acc.from_vector(
       aie::broadcast<score_t, W>((score_t)(ADD_INIT ? bdtm::INIT_PREDICT : 0)));
 
@@ -241,11 +234,9 @@ __attribute__((always_inline)) inline vscore qs_score_group(LoadRow load_row) {
 #pragma unroll
       for (unsigned t = 0; t < bdtm::MAX_TERMS; t++) {
         const unsigned l = j * bdtm::MAX_TERMS + t;
-        // A pad term carries sign 0, so it adds nothing and the trip
-        // count stays a compile-time constant with no guard.
         pa = aie::mac(pa, basis[bterm[l]], bsign[l]);
       }
-      // No shift: the basis is already on the FX_SHIFT grid.
+      // No shift: the basis is already on the FX_SHIFT grid
       const vfeat p = pa.template to_vector<feat_t>(0);
       const vmask m = bdtm::SPLIT_LE ? aie::gt(p, thr[j]) : aie::ge(p, thr[j]);
       v[0] = aie::bit_and(v[0], aie::select(keep_all, bvv[0][j], m));

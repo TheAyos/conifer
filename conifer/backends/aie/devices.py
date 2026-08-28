@@ -1,6 +1,7 @@
-import os
 import json
 import logging
+import os
+
 logger = logging.getLogger(__name__)
 
 _DEVICE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'devices')
