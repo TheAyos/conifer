@@ -15,13 +15,13 @@ _RUNTIME = {'main', '_main_no_exit_init', '_main_init', '_start'}
 
 _NEXT_STAGE = {
     'write': 'run compile() to check the project builds, then build() for the mapped design',
-    'compile': 'run build() for the mapping, tile memory, cycle counts and latency',
+    'compile': 'run build(simulate=False) for the mapping and tile memory, or build(X) for those plus cycle counts, latency and X scored',
     'build': None,
 }
 
 # A hardware compile leaves the mapping behind without simulating, so the compile stage
 # can already carry what the generic hint offers to go and get.
-_NEXT_MAPPED = 'run build() for cycle counts and latency'
+_NEXT_MAPPED = 'run build(X) for cycle counts, latency and X scored'
 
 
 def read_plio(path):
@@ -127,6 +127,49 @@ def _compile_metrics(work_dir, report):
         report['stack_bytes'] = max(stack.values())
 
 
+def _invocation_period_ns(sim_dir, W):
+    """One group's last output to the next group's -- METRICS.md's invocation_period
+
+    Measured from the same output timestamps as latency_ss. Taken from the last word of
+    a group rather than the first, so it includes the time the port spends draining the
+    group it just finished; a period taken between groups omits that and understates
+    what a sample waits.
+    """
+    path = os.path.join(sim_dir, 'scores.dat')
+    if not (W and os.path.isfile(path)):
+        return None
+    ts, _ = read_plio(path)
+    per = np.diff(ts[W - 1::W])
+    return per if len(per) else None
+
+
+def _throughput(sim_dir, meta, n_tiles, split_axis, ghz, report):
+    """Steady-state cost of a sample, from the period the array holds
+
+    A tree-split invocation scores W samples on every tile at once; a sample-split one
+    scores W on each of n_tiles. Which it is, is what the estimate divides by too, so
+    the two numbers are of the same thing.
+    """
+    W = meta.get('config', {}).get('vector_width')
+    per = _invocation_period_ns(sim_dir, W)
+    if per is None:
+        report['throughput_ns_per_sample'] = report.get('run_ns_per_sample')
+        report['throughput_note'] = (
+            'whole run: one group is too few to time a period, so this carries the '
+            'graph startup and falls with n_samples')
+        return
+    samples_per_invocation = W * (n_tiles if split_axis == 'sample' else 1)
+    report['invocation_period_ns'] = float(np.median(per))
+    report['invocation_period_sd_ns'] = float(np.std(per))
+    report['n_invocations'] = int(len(per)) + 1
+    report['throughput_ns_per_sample'] = float(np.median(per) / samples_per_invocation)
+    if 'cyc_per_sample' in report:
+        # What a sample costs beyond the kernel's own time: the array's I/O, now that
+        # the graph's fixed startup is no longer folded in with it.
+        report['io_ns_per_sample'] = float(
+            report['throughput_ns_per_sample'] - report['cyc_per_sample'] / ghz)
+
+
 def _build_metrics(sim_dir, meta, report):
     cores = _cores(sim_dir)
     if not cores:
@@ -150,7 +193,15 @@ def _build_metrics(sim_dir, meta, report):
         report['slowest_tile_ratio'] = float(cps.max() / cps.mean()) if cps.mean() else None
         total = max(c['total'] for c in cores)
         report['total_cyc'] = total
-        report['throughput_ns_per_sample'] = float(total / ghz / n_samples)
+        # Every cycle of the core's run. Its excess over the kernel's own time is a
+        # fixed graph startup and teardown -- 7300 to 9600 cycles whatever the model,
+        # measured across this backend's projects and the research artifacts alike --
+        # so dividing it by the sample count reports that constant more than the
+        # design: +18.7 cyc/sample over 512 samples, +62.7 over 128. METRICS.md keeps
+        # it (as samples_per_cycle) with n_samples as a control variable. Nothing
+        # controls n_samples here, so it is not the headline.
+        report['run_ns_per_sample'] = float(total / ghz / n_samples)
+        _throughput(sim_dir, meta, n_tiles, split_axis, ghz, report)
 
     per_call_ns = np.asarray([c['cyc'] / c['calls'] / ghz for c in cores if c['calls']])
     if not per_call_ns.size:
