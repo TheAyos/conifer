@@ -74,7 +74,7 @@ Tile placement, per-tile memory and program size come from `aiecompiler -target=
 
 ## The vocabulary
 
-Six words the rest of this page assumes, none of them conifer's:
+Five words the rest of this page assumes, none of them conifer's:
 
 - **tile** - one AI Engine core, with its own program and 64 kB of data memory. A VEK280
   has 304 of them.
@@ -86,10 +86,9 @@ Six words the rest of this page assumes, none of them conifer's:
   every sample and emits a partial score, and the partials are summed. Shortens latency.
 - **sample-split** - use more tiles by giving each a subset of the *samples*, with the
   whole ensemble on each. Nothing to sum. Raises throughput.
-- **tau** - trees per tile under tree-split.
 
 One **invocation** is one call of a tile's kernel, scoring `VectorWidth` samples against
-its `tau` trees. It is the unit every cycle count on this page is built from.
+its share of the trees. It is the unit every cycle count on this page is built from.
 
 ## Configuration
 
@@ -109,7 +108,7 @@ the mapping. Nothing chooses them and `resolved_config()` returns them unchanged
 | `SplitAxis` | `auto` | `tree` or `sample` |
 | `VectorWidth` | `auto` | samples per invocation; auto chooses from 8, 16, 32 |
 | `PlioRate` | `auto` | offered input rate in MHz; at most half the array clock |
-| `Tau` | `auto` | trees per tile under tree-split |
+| `TreesPerTile` | `auto` | how many trees each tile takes under tree-split |
 | `NSamples` | `auto` | rows the graph is compiled to score in one run |
 | `Shard` | `auto` | narrow each tile's feature rows to a window: `auto` searches the layout, `fast` uses a heuristic, `False` reads every row |
 | `Feed` | `auto` | `memtile` shares one input across the array; `plio` gives each tile a port |

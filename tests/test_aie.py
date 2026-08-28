@@ -98,7 +98,7 @@ def test_auto_config_round_trips(skl_model, tmp_path):
 
     cfg = _config(tmp_path / 'b')
     cfg.update({k: resolved[k] for k in
-                ('priority', 'n_tiles', 'split_axis', 'vector_width', 'tau', 'n_samples')})
+                ('priority', 'n_tiles', 'split_axis', 'vector_width', 'trees_per_tile', 'n_samples')})
     b = conifer.converters.convert_from_sklearn(clf, cfg)
     b.write()
     for f in ['src/parameters.h', 'aie_model.json']:

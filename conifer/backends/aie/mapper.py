@@ -1,10 +1,11 @@
-import math
 import logging
+import math
+
 logger = logging.getLogger(__name__)
 
 AIE_CLOCK_GHZ = 1.25
 
-# cyc/invocation = base + n_features * row + per_tree * tau, measured at f16/W=32/int16.
+# cyc/invocation = base + n_features * row + per_tree * trees_per_tile, measured at f16/W=32/int16.
 # Piecewise rather than smooth in depth: the cost steps where bv_t widens.
 _DEPTH_COST = {2: (107, 50.5),
                3: (104, 91.0),
@@ -20,8 +21,7 @@ _PRIORITY_W = {'latency': 16, 'throughput': 32}
 # A latency mapping grows while a doubling of the tile count still buys this much.
 _MARGINAL_GAIN = 0.10
 
-# Both priorities keep paying past this, so auto stops here for compile time and says so.
-# One ceiling for both: per-priority ceilings let one priority win the other's metric.
+# Auto stops here for compile time, but both priorities keep paying past this
 _AUTO_TILE_CEILING = 16
 
 
@@ -47,7 +47,7 @@ def bitvector_bits(max_depth):
 def vector_width(priority, max_depth):
     '''Samples per invocation, from the priority knob
 
-    The measured optimum at the tau a latency mapping lands on. choose_mapping picks it
+    The measured optimum at the trees_per_tile a latency mapping lands on. choose_mapping picks it
     from the cost model instead when the tile count is free.
     '''
     return _PRIORITY_W[priority]
@@ -113,7 +113,7 @@ _REGISTER_BITS = 512
 # The share of per-tree work that does not scale with the bitvector's register count.
 _PER_TREE_FLOOR = 0.5
 
-# Measured: fixed + 11.9 * basis_n + 380 * tau. The basis belongs to the ensemble, not
+# Measured: fixed + 11.9 * basis_n + 380 * trees_per_tile. The basis belongs to the ensemble, not
 # the shard, so tree-split does not divide it -- and one multiplier would.
 _OBLIQUE_PER_TREE_TAX = 380.0 / 156.0
 _BASIS_CYC_PER_ENTRY = 11.9
@@ -139,8 +139,8 @@ def _register_scale(W, max_depth):
     return _PER_TREE_FLOOR + (1.0 - _PER_TREE_FLOOR) * ratio
 
 
-def _invocation_parts(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
-    '''(what one invocation pays whatever tau is, what it pays per tree)
+def _invocation_parts(n_features, max_depth, trees_per_tile, W, feat_bytes, feed='plio'):
+    '''(what one invocation pays whatever trees_per_tile is, what it pays per tree)
 
     n_features is the busiest tile's row count, which sharding reduces. A memtile row is
     two wide loads rather than sixteen stream reads, so the fill term nearly vanishes.
@@ -150,12 +150,12 @@ def _invocation_parts(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
     # The setup term scales with the group, like the rows do: measured fixed roughly
     # halves from W=32 to W=16.
     base *= W * feat_bytes / _FIT_BYTES
-    return base + n_features * row, per_tree * _register_scale(W, max_depth) * tau
+    return base + n_features * row, per_tree * _register_scale(W, max_depth) * trees_per_tile
 
 
-def invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
-    '''Cycles for one invocation, which scores W samples against tau trees'''
-    fixed, trees = _invocation_parts(n_features, max_depth, tau, W, feat_bytes, feed)
+def invocation_cycles(n_features, max_depth, trees_per_tile, W, feat_bytes, feed='plio'):
+    '''Cycles for one invocation, which scores W samples against trees_per_tile trees'''
+    fixed, trees = _invocation_parts(n_features, max_depth, trees_per_tile, W, feat_bytes, feed)
     return fixed + trees
 
 
@@ -198,12 +198,12 @@ def _split_axis(priority):
     return 'tree' if priority == 'latency' else 'sample'
 
 
-def _tau_for(n_trees, n_tiles, split_axis):
+def _trees_per_tile_for(n_trees, n_tiles, split_axis):
     # Sample-split gives every tile the whole ensemble; tree-split divides it, with the
     # busiest tile taking the ceiling.
     if split_axis == 'sample':
         return n_trees
-    return int(math.ceil(n_trees / n_tiles))
+    return math.ceil(n_trees / n_tiles)
 
 
 def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
@@ -215,8 +215,8 @@ def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
     budget to stay inside, which axis serves them is an answer rather than an input.
     '''
     split_axis = split_axis or _split_axis(priority)
-    tau = _tau_for(n_trees, n_tiles, split_axis)
-    fixed, trees = _invocation_parts(n_features, max_depth, tau, W, feat_bytes, feed)
+    trees_per_tile = _trees_per_tile_for(n_trees, n_tiles, split_axis)
+    fixed, trees = _invocation_parts(n_features, max_depth, trees_per_tile, W, feat_bytes, feed)
     if oblique:
         inv = fixed + _OBLIQUE_PER_TREE_TAX * trees + _BASIS_CYC_PER_ENTRY * basis_n
     else:
@@ -227,7 +227,7 @@ def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
             'est_cyc_per_sample': inv / samples_per_inv,
             'est_latency_ss_ns': 1.1 * inv / AIE_CLOCK_GHZ,
             'est_throughput_ns_per_sample': inv / samples_per_inv / AIE_CLOCK_GHZ,
-            'tau': tau,
+            'trees_per_tile': trees_per_tile,
             'split_axis': split_axis,
             }
 

@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cstdint>
 #include "parameters.h"
+#include <cstdint>
 
 #ifndef BDT_W
 #define BDT_W 16
@@ -11,8 +11,9 @@
 #define BDT_N_TILES 1
 #endif
 
-// 1 = tree-split   : disjoint tree subsets, same samples, partial scores summed off-array
-// 0 = sample-split : full ensemble per tile, distinct samples, no merge
+// 1 = tree-split   : disjoint tree subsets, same samples, partial scores summed
+// off-array 0 = sample-split : full ensemble per tile, distinct samples, no
+// merge
 #ifndef BDT_SPLIT_TREE
 #define BDT_SPLIT_TREE 0
 #endif
@@ -28,33 +29,36 @@
 
 namespace bdtmt {
 
-constexpr unsigned N_TILES    = BDT_N_TILES;
-constexpr bool     SPLIT_TREE = (BDT_SPLIT_TREE != 0);
-constexpr unsigned N_SHARDS   = SPLIT_TREE ? N_TILES : 1u;
-constexpr unsigned DELTA      = BDT_DELTA;
-constexpr double   PLIO_RATE  = BDT_PLIO_RATE;
+constexpr unsigned N_TILES = BDT_N_TILES;
+constexpr bool SPLIT_TREE = (BDT_SPLIT_TREE != 0);
+constexpr unsigned N_SHARDS = SPLIT_TREE ? N_TILES : 1u;
+constexpr unsigned DELTA = BDT_DELTA;
+constexpr double PLIO_RATE = BDT_PLIO_RATE;
 
-// An oblique node has a dense weight row and a basis over the global feature set, so
-// there is no per-shard feature frame to hand a tile: every tile reads every row and the
-// merge is the per-tile one. The memtile feed and span sharding are axis-aligned only.
+// An oblique node has a dense weight row and a basis over the global feature
+// set, so there is no per-shard feature frame to hand a tile: every tile reads
+// every row and the merge is the per-tile one. The memtile feed and span
+// sharding are axis-aligned only.
 constexpr unsigned TAU = bdtm::N_TREES / N_SHARDS;
-static_assert(bdtm::N_TREES % N_SHARDS == 0,
-              "n_trees must divide evenly across the tiles; conifer's writer pads the "
-              "ensemble so that it does");
+static_assert(
+    bdtm::N_TREES % N_SHARDS == 0,
+    "n_trees must divide evenly across the tiles; conifer's writer pads the "
+    "ensemble so that it does");
 
 constexpr unsigned t_begin(unsigned shard) { return shard * TAU; }
-constexpr unsigned t_count(unsigned)       { return TAU; }
+constexpr unsigned t_count(unsigned) { return TAU; }
 
 // The ensemble's base score belongs to exactly one tile.
 constexpr bool adds_init(unsigned shard) { return shard == 0; }
 
-}  // namespace bdtmt
+} // namespace bdtmt
 
-// One group of W samples per kernel invocation, so the graph runs N_SAMPLES / W times
-// and the profile's cycles/call covers W samples.
+// One group of W samples per kernel invocation, so the graph runs N_SAMPLES / W
+// times and the profile's cycles/call covers W samples.
 static_assert(bdtm::N_SAMPLES % BDT_W == 0,
               "N_SAMPLES must be a whole number of W-sample groups");
-static_assert(bdtmt::SPLIT_TREE || (bdtm::N_SAMPLES / BDT_W) % bdtmt::N_TILES == 0,
+static_assert(bdtmt::SPLIT_TREE ||
+                  (bdtm::N_SAMPLES / BDT_W) % bdtmt::N_TILES == 0,
               "sample-split needs the group count to divide across the tiles");
 constexpr unsigned iter_count =
     bdtmt::SPLIT_TREE ? (bdtm::N_SAMPLES / BDT_W)

@@ -1,7 +1,7 @@
 #pragma once
-#include <type_traits>
-#include <aie_api/aie.hpp>
 #include "parameters.h"
+#include <aie_api/aie.hpp>
+#include <type_traits>
 
 #ifndef BDT_W
 #define BDT_W 16
@@ -21,10 +21,11 @@ using vidx = aie::vector<int16_t, W>;
 using vmask = aie::mask<W>;
 
 template <typename A>
-using elem_of = std::remove_cv_t<std::remove_reference_t<decltype(std::declval<A &>()[0])>>;
+using elem_of =
+    std::remove_cv_t<std::remove_reference_t<decltype(std::declval<A &>()[0])>>;
 
-using acc_tag = std::conditional_t<std::is_floating_point_v<score_t>,
-                                   accfloat, acc32>;
+using acc_tag =
+    std::conditional_t<std::is_floating_point_v<score_t>, accfloat, acc32>;
 using vacc = aie::accum<acc_tag, W>;
 
-}  // namespace bdtv
+} // namespace bdtv

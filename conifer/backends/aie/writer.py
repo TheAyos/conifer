@@ -1,19 +1,23 @@
-import os
 import copy
 import json
+import logging
 import math
+import os
 import shutil
+
 import numpy as np
-from conifer.utils import copydocstring
+
+from conifer.backends.aie import checks, mapper, roles, tools
+from conifer.backends.aie import shard as _shard
+from conifer.backends.aie import tables as _tables
+from conifer.backends.aie.devices import get_device_config
+from conifer.backends.aie.platforms import find_platform, resolve_platform
+from conifer.backends.aie.precision import COMPARE_WIDTH, SCORE_WIDTH, Precision
+from conifer.backends.aie.report import read_aie_report
 from conifer.backends.common import MultiPrecisionConfig
 from conifer.model import ModelBase
-from conifer.backends.aie import checks, mapper, roles, shard as _shard, tables as _tables
-from conifer.backends.aie.precision import Precision, COMPARE_WIDTH, SCORE_WIDTH
-from conifer.backends.aie.devices import get_device_config
-from conifer.backends.aie.report import read_aie_report
-from conifer.backends.aie.platforms import find_platform, resolve_platform
-from conifer.backends.aie import tools
-import logging
+from conifer.utils import copydocstring
+
 logger = logging.getLogger(__name__)
 
 AUTO = 'auto'
@@ -30,13 +34,13 @@ class AIEConfig(MultiPrecisionConfig):
     backend = 'aie'
     _config_fields = MultiPrecisionConfig._config_fields + [
         'priority',
-        'n_tiles', 'split_axis', 'vector_width', 'tau', 'n_samples',
+        'n_tiles', 'split_axis', 'vector_width', 'trees_per_tile', 'n_samples',
         'shard', 'feed', 'plio_rate', 'xilinx_part', 'platform', 'elfgen_jobs']
-    _aie_alts = {'priority': ['Priority'],
+    _aie_alts = {'priority': ['Priority'],  # noqa: RUF012
                  'n_tiles': ['NTiles'],
                  'split_axis': ['SplitAxis'],
                  'vector_width': ['VectorWidth', 'W'],
-                 'tau': ['Tau'],
+                 'trees_per_tile': ['TreesPerTile'],
                  'n_samples': ['NSamples'],
                  'shard': ['Shard'],
                  'feed': ['Feed'],
@@ -45,14 +49,14 @@ class AIEConfig(MultiPrecisionConfig):
                  'platform': ['Platform'],
                  'elfgen_jobs': ['ElfgenJobs'],
                  }
-    _alternates = {**MultiPrecisionConfig._alternates, **_aie_alts}
-    _aie_defaults = {'precision': _DEFAULT_COMPARE,
+    _alternates = {**MultiPrecisionConfig._alternates, **_aie_alts}  # noqa: RUF012
+    _aie_defaults = {'precision': _DEFAULT_COMPARE,  # noqa: RUF012
                      'score_precision': _DEFAULT_SCORE,
                      'priority': 'latency',
                      'n_tiles': AUTO,
                      'split_axis': AUTO,
                      'vector_width': AUTO,
-                     'tau': AUTO,
+                     'trees_per_tile': AUTO,
                      'n_samples': AUTO,
                      'shard': AUTO,
                      'feed': AUTO,
@@ -61,12 +65,12 @@ class AIEConfig(MultiPrecisionConfig):
                      'platform': None,
                      'elfgen_jobs': None,
                      }
-    _defaults = {**MultiPrecisionConfig._defaults, **_aie_defaults}
+    _defaults = {**MultiPrecisionConfig._defaults, **_aie_defaults}  # noqa: RUF012
     _allow_undefined = [*MultiPrecisionConfig._allow_undefined] + [
         'platform', 'elfgen_jobs']
 
     def __init__(self, configDict, validate=True):
-        super(AIEConfig, self).__init__(configDict, validate=False)
+        super().__init__(configDict, validate=False)
         for key, val in AIEConfig._aie_defaults.items():
             if getattr(self, key, None) is None and key in AIEConfig._config_fields:
                 setattr(self, key, val)
@@ -79,9 +83,8 @@ class AIEConfig(MultiPrecisionConfig):
         return copy.deepcopy(AIEConfig._defaults)
 
     def _validate(self):
-        # The base class only checks that nothing is missing, so _extra_validate has to
-        # be called from here or every check in it is dead.
-        super(AIEConfig, self)._validate()
+        # The base class only checks that nothing is missing
+        super()._validate()
         self._extra_validate()
 
     def _extra_validate(self):
@@ -105,7 +108,7 @@ class AIEConfig(MultiPrecisionConfig):
 class AIEModel(ModelBase):
 
     def __init__(self, ensembleDict, config, metadata=None):
-        super(AIEModel, self).__init__(ensembleDict, config, metadata)
+        super().__init__(ensembleDict, config, metadata)
         self.config = AIEConfig(config)
         cfg = self.config
 
@@ -243,22 +246,22 @@ class AIEModel(ModelBase):
     def _finish_mapping(self, cfg):
         '''Everything that follows from (n_tiles, W, split_axis), whichever chose them.
 
-        tau, the null-tree padding, the batch size and the forward estimate are
+        trees_per_tile, the null-tree padding, the batch size and the forward estimate are
         consequences of the mapping and not of how it was picked.
         '''
         if self.split_axis == 'tree' and self.n_tiles > 1:
-            self.tau = (int(math.ceil(self.tables.n_trees / self.n_tiles))
-                        if cfg.tau == AUTO else int(cfg.tau))
+            self.trees_per_tile = (math.ceil(self.tables.n_trees / self.n_tiles)
+                        if cfg.trees_per_tile == AUTO else int(cfg.trees_per_tile))
         else:
-            self.tau = self.tables.n_trees
+            self.trees_per_tile = self.tables.n_trees
         # Every shard runs t_count = TAU trees, so a ragged split overruns the last one.
         # Null trees make the split exact and contribute zero.
-        self.n_trees_padded = (self.tau * self.n_tiles if self.split_axis == 'tree'
+        self.n_trees_padded = (self.trees_per_tile * self.n_tiles if self.split_axis == 'tree'
                                else self.tables.n_trees)
         if self.n_trees_padded > self.tables.n_trees:
             self._notes.append(
                 f'padding {self.tables.n_trees} trees to {self.n_trees_padded} with null '
-                f'trees so every tile takes exactly tau={self.tau}')
+                f'trees so every tile takes exactly trees_per_tile={self.trees_per_tile}')
 
         self.n_samples = (self._auto_n_samples() if cfg.n_samples == AUTO
                           else self._round_batch(int(cfg.n_samples)))
@@ -318,7 +321,7 @@ class AIEModel(ModelBase):
         step = self.batch_step
         if n < 1:
             raise ValueError(f'n_samples must be at least 1, got {n}')
-        rounded = step * int(math.ceil(n / step))
+        rounded = step * math.ceil(n / step)
         if rounded != n:
             logger.info(f'n_samples {n} rounded up to {rounded}: a run is a whole number '
                         f'of {step}-sample groups')
@@ -332,7 +335,7 @@ class AIEModel(ModelBase):
         target across mappings so two configurations of the same model stay comparable.
         '''
         step = self.W * (self.n_tiles if self.split_axis == 'sample' else 1)
-        return step * int(math.ceil(DEFAULT_BATCH / step))
+        return step * math.ceil(DEFAULT_BATCH / step)
 
     def _check_shape(self):
         assert self.n_samples % self.batch_step == 0, 'batch is not a whole run'
@@ -370,7 +373,7 @@ class AIEModel(ModelBase):
                     'n_tiles': self.n_tiles,
                     'split_axis': self.split_axis,
                     'vector_width': self.W,
-                    'tau': self.tau,
+                    'trees_per_tile': self.trees_per_tile,
                     'n_samples': self.n_samples,
                     'shard': self.sharding is not None,
                     'feed': 'memtile' if self.feed_memtile else 'plio',
@@ -494,8 +497,8 @@ class AIEModel(ModelBase):
               f'#define BDT_SPLIT_TREE {1 if self.split_axis == "tree" else 0}',
               f'#define BDT_DELTA {self.delta}']
         if self.family == 'axis':
-            s += [f'#define BDT_FEED_PLIO 0',
-                  f'#define BDT_TAU {self.tau if self.split_axis == "tree" else 0}',
+            s += ['#define BDT_FEED_PLIO 0',
+                  f'#define BDT_TAU {self.trees_per_tile if self.split_axis == "tree" else 0}',
                   f'#define BDT_SHARDED {1 if self.sharding else 0}',
                   f'#define BDT_FEED_MEMTILE {1 if self.feed_memtile else 0}',
                   '#define BDT_MT_FANOUT 8',
@@ -558,13 +561,13 @@ class AIEModel(ModelBase):
     @copydocstring(ModelBase.decision_function)
     def decision_function(self, X, trees=False):
         if trees:
-            logger.warn('Individual tree output (trees=True) is not implemented for the aie '
+            logger.warning('Individual tree output (trees=True) is not implemented for the aie '
                         'backend')
         X = np.asarray(X)
         assert X.shape[1] == self.n_features, \
             f'Wrong number of features, expected {self.n_features}, got {X.shape[1]}'
         n, batch = len(X), self.n_samples
-        runs = int(math.ceil(n / batch))
+        runs = math.ceil(n / batch)
         if runs > 1:
             logger.info(f'scoring {n} samples in {runs} runs of {batch}: the graph is '
                         f'compiled for a fixed batch, set NSamples to change it')
@@ -738,7 +741,7 @@ def auto_config(granularity='simple'):
               'NTiles': AUTO,
               'SplitAxis': AUTO,
               'VectorWidth': AUTO,
-              'Tau': AUTO,
+              'TreesPerTile': AUTO,
               'NSamples': AUTO,
               'Shard': AUTO,
               'Feed': AUTO,

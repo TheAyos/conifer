@@ -15,8 +15,8 @@ def tree_feature_sets(tables, n_trees, nodes_per_tree):
 
 
 def assign_contiguous(n_trees, n_shards):
-    tau = n_trees // n_shards
-    return [list(range(s * tau, (s + 1) * tau)) for s in range(n_shards)]
+    trees_per_tile = n_trees // n_shards
+    return [list(range(s * trees_per_tile, (s + 1) * trees_per_tile)) for s in range(n_shards)]
 
 
 def feature_permutation(groups, tree_feats, n_features, sweeps=20):
@@ -67,12 +67,12 @@ def search_span(tree_feats, n_trees, n_features, n_shards, seed=0, restarts=6,
     if iters is None:
         iters = min(120_000, max(6_000, 400 * (n_trees + n_features * n_shards)))
     rng = random.Random(seed)
-    tau = n_trees // n_shards
+    trees_per_tile = n_trees // n_shards
     best = None
     for _ in range(restarts):
         order = list(range(n_trees))
         rng.shuffle(order)
-        g = [order[s * tau:(s + 1) * tau] for s in range(n_shards)]
+        g = [order[s * trees_per_tile:(s + 1) * trees_per_tile] for s in range(n_shards)]
         fperm = list(range(n_features))
         rng.shuffle(fperm)
         cur = _cost(g, tree_feats, fperm)
