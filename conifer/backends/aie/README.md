@@ -56,7 +56,7 @@ print(model.read_report())
 | `write()` | nothing | the project, the resolved mapping, and a forward cost estimate |
 | `compile()` | `aiecompiler` | that the project builds, for the x86 functional path |
 | `decision_function(X)` | `x86simulator` | scores, bit-accurate to the hardware arithmetic |
-| `build()` | `aiesimulator` | cycles: `cyc_per_sample`, `latency_ss_ns`, `slowest_tile_ratio` |
+| `build()` | `aiesimulator` | cycles: `cyc_per_sample`, `latency_ss_ns` (steady-state latency, below), `slowest_tile_ratio` |
 
 `read_report()` returns whatever stage is on disk, with a `stage` key naming it and a
 `next_step` hint for the rest. It never fails for a stage that has not run.
@@ -67,6 +67,25 @@ fails says so, names its log, and quotes the first error the tools reported.
 
 Tile placement, per-tile memory and program size come from `aiecompiler -target=hw`, which
 `build()` runs; the x86 compile produces no map report.
+
+## The vocabulary
+
+Six words the rest of this page assumes, none of them conifer's:
+
+- **tile** - one AI Engine core, with its own program and 64 kB of data memory. A VEK280
+  has 304 of them.
+- **PLIO** - the stream ports between the array and the rest of the chip. They are a
+  scarcer resource than the cores: this platform routes 112 outgoing ones.
+- **memtile** - a shared on-chip buffer that several tiles can read from, each at its own
+  offset. It is how different tiles get *different* data from one input port.
+- **tree-split** - use more tiles by giving each a subset of the trees. Every tile sees
+  every sample and emits a partial score, and the partials are summed. Shortens latency.
+- **sample-split** - use more tiles by giving each a subset of the *samples*, with the
+  whole ensemble on each. Nothing to sum. Raises throughput.
+- **tau** - trees per tile under tree-split.
+
+One **invocation** is one call of a tile's kernel, scoring `VectorWidth` samples against
+its `tau` trees. It is the unit every cycle count on this page is built from.
 
 ## Configuration
 
@@ -83,7 +102,7 @@ in; passing that back reproduces the same project.
 | `PlioRate` | `auto` | offered input rate in MHz; at most half the array clock |
 | `Tau` | `auto` | trees per tile under tree-split |
 | `NSamples` | `auto` | rows the graph is compiled to score in one run |
-| `Shard` | `auto` | `auto` searches the layout, `fast` skips the search, `False` disables sharding |
+| `Shard` | `auto` | narrow each tile's feature rows to a window: `auto` searches the layout, `fast` uses a heuristic, `False` reads every row |
 | `Feed` | `auto` | `memtile` shares one input across the array; `plio` gives each tile a port |
 | `XilinxPart` | `xcve2802-vsvh1760-2MP-e-S` | selects the device record |
 | `Platform` | `auto` | `.xpfm` to build against; found from the Vitis environment when unset |
@@ -101,23 +120,40 @@ WeightPrecision                                   ap_fixed<16,I,AP_RND_CONV,AP_S
 `AP_RND_CONV,AP_SAT` is required because the kernels are bit-exact against that grid;
 the `ap_fixed` default `AP_TRN,AP_WRAP` would score on a different one.
 
-## Sharding and the memtile feed
+## Giving each tile less to read
 
-Under tree-split with more than one tile the backend permutes trees and feature rows so
-each tile reads a contiguous window of rows rather than all of them, and feeds the array
-from a memtile: one input port writes each group into a shared buffer that every tile
-reads its own window from. Measured on VEK280 this is better on latency, period, port
-count and balance at every tile count.
+Splitting trees across tiles divides the *work*, but not the *input*: by default every
+tile still reads every feature of every sample, and then waits on rows most of its trees
+never test.
 
-Sample-split is never sharded - a sample-split tile holds the whole ensemble, so it
-reads every row. Set `Shard=False` or `Feed='plio'` to decline either.
+It does not have to. A tile's trees are fixed when the project is written, so the features
+those trees test are known too. The backend uses that twice - it chooses **which trees go
+on which tile**, and it **reorders the feature rows** - so that the features one tile
+needs end up next to each other. Each tile then reads a single contiguous window of rows
+instead of the whole sample. The code calls this *sharding*.
+
+Delivering different rows to different tiles needs the **memtile feed**: one input port
+writes each sample group into a shared buffer, and each tile reads only its own window out
+of it. A multicast PLIO cannot do it - every tile gets the same stream - so `Feed='plio'`
+declines the windowing along with the memtile.
+
+`write()` says what it achieved, and is honest when that is nothing:
+
+    sharded: each tile reads 13 of 16 feature rows at worst (46 across the array)
+
+Ten of ten would mean the trees on every tile touch every feature, so there was nothing to
+cut. Measured on VEK280 the memtile feed is better on latency, period, port count and
+balance at every tile count, whether or not the windowing saves rows.
+
+Sample-split never does this: such a tile holds the whole ensemble, so it reads every row
+regardless. `Shard=False` declines the windowing on its own.
 
 The tree assignment and the feature order are searched together, seeded so a build is
 reproducible; `Shard='fast'` takes a deterministic heuristic instead, at a few percent
 more rows.
 
-Every sharded model is checked before it is emitted: the per-tile partial scores are
-replayed and required to sum to exactly what the unsharded tables score.
+Every windowed model is checked before it is emitted: the per-tile partial scores are
+replayed and required to sum to exactly what the unwindowed tables score.
 
 ## Kernels
 
@@ -129,13 +165,17 @@ replayed and required to sum to exactly what the unsharded tables score.
 An oblique split tests `w · x <= threshold`. Only binary ±1 projection weights are
 supported, which is what ydf's default `sparse_oblique_weights="BINARY"` emits.
 
-Tree-split divides an oblique ensemble the same way it divides an axis-aligned one, but
-it does **not** divide the basis: the signed pairs are built once per sample group over
-the whole feature set, on every tile, because they are a property of the ensemble rather
-than of the shard. That term is what an oblique mapping saturates against - the estimate
-prices it separately for exactly this reason. An oblique model also never shards its
-feature rows or takes the memtile feed: an oblique node reads a dense weight row, so
-there is no per-shard feature frame to hand a tile.
+Tree-split divides an oblique ensemble as it divides an axis-aligned one, with one
+exception that governs how well it scales. Before testing any node, a tile builds the
+**basis**: the signed feature pairs every oblique split is expressed in. That is built
+once per sample group over the whole feature set, and it belongs to the ensemble rather
+than to any tile's share of it - so adding tiles divides the tree work and leaves the
+basis exactly where it was. It is what an oblique mapping saturates against, and the
+estimate prices it as its own term for that reason. Four tiles measured 2.58x, not 4x.
+
+An oblique model also reads every feature row on every tile, and takes the plain PLIO
+feed. Narrowing rows needs to know which features a tile's trees test; an oblique node
+tests a dense weight row over all of them, so there is nothing to narrow.
 
 ## Limits
 
@@ -188,7 +228,8 @@ prices them, but set `VectorWidth` explicitly to use one.
 
 `slowest_tile_ratio` is the busiest tile's cycles over the average tile's. **1.0 is a
 perfectly balanced array**; 1.05 means the busiest tile does 5% more work than the
-average one, and the whole array waits for it. Sharding exists to keep it near 1.
+average one, and the whole array waits for it. Narrowing each tile's rows, above,
+is what keeps it near 1.
 
 ## What `latency_ss` means
 
