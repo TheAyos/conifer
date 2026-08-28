@@ -793,6 +793,22 @@ def test_the_search_space_follows_the_device_not_the_old_ladder():
 
 # ----- things the phase 6.1 sweep caught -----
 
+def test_oblique_sample_split_deals_files_too(ydf_model, tmp_path):
+    """Sample-split is reachable for oblique now that it is not pinned to one tile, and
+    its graph names per-tile inputs exactly as the axis-aligned one does.
+    """
+    ymodel, _ = ydf_model
+    cfg = _oblique_config(tmp_path)
+    cfg.update({'NTiles': 4, 'SplitAxis': 'sample', 'Priority': 'throughput'})
+    model = conifer.converters.convert_from_ydf(ymodel, cfg)
+    model.write()
+    model.write_input(np.zeros((model.n_samples, model.n_features)))
+    written = sorted(f for f in os.listdir(tmp_path / 'data') if f.endswith('.dat'))
+    assert len(written) == 4, written
+    key = f'.n{model.n_tiles}d{model.delta}'
+    assert all(f'x{key}.t{t}.dat' in written for t in range(4))
+
+
 def test_sample_split_deals_a_file_per_tile(skl_model, tmp_path):
     """Each tile scores its own samples, so each reads its own cut of the input"""
     clf, _ = skl_model
