@@ -101,10 +101,18 @@ replayed and required to sum to exactly what the unsharded tables score.
 | model | kernel | tiles |
 |---|---|---|
 | axis-aligned | QuickScorer, per-tree layout, multi-tile | 1–112 |
-| oblique, weights in {0, ±1} | QuickScorer with a partial-projection basis | 1 |
+| oblique, weights in {0, ±1} | QuickScorer with a partial-projection basis | 1–112 |
 
 An oblique split tests `w · x <= threshold`. Only binary ±1 projection weights are
 supported, which is what ydf's default `sparse_oblique_weights="BINARY"` emits.
+
+Tree-split divides an oblique ensemble the same way it divides an axis-aligned one, but
+it does **not** divide the basis: the signed pairs are built once per sample group over
+the whole feature set, on every tile, because they are a property of the ensemble rather
+than of the shard. That term is what an oblique mapping saturates against - the estimate
+prices it separately for exactly this reason. An oblique model also never shards its
+feature rows or takes the memtile feed: an oblique node reads a dense weight row, so
+there is no per-shard feature frame to hand a tile.
 
 ## Limits
 
@@ -113,7 +121,6 @@ Raised at `write()`:
 - `max_depth > 6` — the result bitvector holds one bit per leaf and reaches two words
 - oblique projection weights outside {0, ±1}
 - more than two classes — the kernels score one value per sample
-- an oblique model with `n_tiles > 1` — no multi-tile oblique kernel exists
 - `n_tiles` above the device's tile count, or above the outgoing PLIO channels the
   platform routes: every tile emits its own partial score on its own channel, on both
   split axes, and the outgoing side binds first
