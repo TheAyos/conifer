@@ -3,7 +3,6 @@ import copy
 import json
 import math
 import shutil
-import datetime
 import numpy as np
 from conifer.utils import copydocstring
 from conifer.backends.common import MultiPrecisionConfig
@@ -182,7 +181,7 @@ class AIEModel(ModelBase):
         self._verify_sharding()
         self.feed_memtile = True
         self._notes.append(
-            f'sharded: each tile reads {self.sharding.straggler_rows} of '
+            f'sharded: each tile reads {self.sharding.max_rows_per_tile} of '
             f'{self.n_features_padded} feature rows at worst '
             f'({self.sharding.total_rows} across the array)'
             + (', fed from a memtile' if self.feed_memtile else ''))
@@ -307,7 +306,7 @@ class AIEModel(ModelBase):
         self._set_estimate()
 
     def _set_estimate(self):
-        rows = (self.sharding.straggler_rows if getattr(self, 'sharding', None)
+        rows = (self.sharding.max_rows_per_tile if getattr(self, 'sharding', None)
                 else self.n_features_padded)
         # THE AXIS IS PASSED, not re-derived from the priority. Under the long form the
         # two can differ -- a latency budget met by sample-split, say -- and an estimate
@@ -453,8 +452,6 @@ class AIEModel(ModelBase):
         logger.info(f'estimated {self.estimate["est_cyc_per_sample"]:.1f} cyc/sample, '
                     f'latency_ss {self.estimate["est_latency_ss_ns"]:.0f} ns on '
                     f'{self.n_tiles} tile(s)')
-        for v in self.estimate['validity']:
-            logger.info(f'estimate caveat: {v}')
 
     def _write_makefile(self):
         cfg = self.config
@@ -495,7 +492,7 @@ class AIEModel(ModelBase):
                 'memory': self.memory,
                 'sharding': None if self.sharding is None else {
                     'n_feat': self.sharding.n_feat,
-                    'straggler_rows': self.sharding.straggler_rows,
+                    'max_rows_per_tile': self.sharding.max_rows_per_tile,
                     'total_rows': self.sharding.total_rows,
                     'feature_order': self.sharding.fperm,
                 },
@@ -722,12 +719,7 @@ class AIEModel(ModelBase):
     @copydocstring(ModelBase.build)
     def build(self, **kwargs):
         self.write()
-        start = datetime.datetime.now()
-        logger.info(f'build starting {start:%H:%M:%S}')
-        ok = tools.run_make(self.config.output_dir, 'aiesim', PLATFORM=self.platform())
-        stop = datetime.datetime.now()
-        logger.info(f'build finished {stop:%H:%M:%S} - took {str(stop - start)}')
-        return ok
+        return tools.run_make(self.config.output_dir, 'aiesim', PLATFORM=self.platform())
 
     def read_report(self) -> dict:
         '''Read whatever stage of report is on disk

@@ -221,11 +221,6 @@ def test_auto_tiles_explains_where_it_stopped():
     assert any('n_tiles' in s for s in notes)
 
 
-def test_estimate_declares_its_extrapolations():
-    e = mapper.estimate(32, 6, 16, 1, 32, 2, 4, 'latency', oblique=True)
-    assert e['validity'], 'a depth-6 oblique estimate must say what it extrapolates'
-
-
 def test_a_huge_ensemble_does_not_fit_one_tile():
     mem = mapper.table_bytes(10000, 4, 16, 16, 32, 2, 4, False)
     assert mem['total'] > 0x10000
@@ -453,19 +448,6 @@ def test_cost_model_tracks_the_measured_width_sweep(depth, W, measured):
     '''One tree per tile, 16 features, int16 - the shape the widths were swept at'''
     got = mapper.invocation_cycles(16, depth, 1, W, 2)
     assert abs(got - measured) / measured < 0.10
-
-
-def test_an_unswept_width_says_so(skl_model, tmp_path):
-    '''W=8 at depth 4 is priced by mechanism, not measured; the estimate must admit it'''
-    clf, _ = skl_model
-    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path, VectorWidth=8))
-    assert any('not swept' in v for v in model.estimate['validity'])
-
-
-def test_a_swept_width_carries_no_caveat(skl_model, tmp_path):
-    clf, _ = skl_model
-    model = conifer.converters.convert_from_sklearn(clf, _config(tmp_path, VectorWidth=32))
-    assert not any('not swept' in v for v in model.estimate['validity'])
 
 
 # ----- latency_ss is a fit, not a mean -----
@@ -745,6 +727,52 @@ def test_the_ladder_marks_tile_zero_and_only_tile_zero():
     assert all('ROLE0' not in d for d in decl[1:] + defn[1:])
 
 
+def _capture_logger(monkeypatch, module):
+    """Record what a module logs, without emitting records the no-error fixture sees"""
+    import types
+    lines = []
+    monkeypatch.setattr(module, 'logger', types.SimpleNamespace(
+        info=lambda m, *a: lines.append(('info', str(m))),
+        debug=lambda m, *a: lines.append(('debug', str(m))),
+        warning=lambda m, *a: lines.append(('warning', str(m))),
+        error=lambda m, *a: lines.append(('error', str(m)))))
+    return lines
+
+
+def test_a_failed_run_names_its_log_and_the_first_error(tmp_path, monkeypatch):
+    """A tool that fails leaves hundreds of lines behind; the point of capturing them is
+    to be told where they are and what the first one said.
+    """
+    from conifer.backends.aie import tools
+    log = tmp_path / 'x86sim_build.log'
+    monkeypatch.setattr(tools, 'require_tools', lambda *a: None)
+
+    def fail(cmd):
+        log.write_text('INFO: compiling\n'
+                       '../src/params.h:99:15: error: static assertion failed\n'
+                       'ERROR: [aiecompiler 77-753] cannot recover\n')
+        return 512
+
+    monkeypatch.setattr(tools.os, 'system', fail)
+    lines = _capture_logger(monkeypatch, tools)
+
+    assert tools.run_make(str(tmp_path), 'x86sim_build') is False
+    errors = [m for lvl, m in lines if lvl == 'error']
+    assert errors and str(log) in errors[0]
+    assert 'static assertion failed' in errors[0], 'the first error, not the last'
+
+
+def test_a_successful_run_still_says_where_the_log_is(tmp_path, monkeypatch):
+    from conifer.backends.aie import tools
+    monkeypatch.setattr(tools, 'require_tools', lambda *a: None)
+    monkeypatch.setattr(tools.os, 'system', lambda cmd: 0)
+    lines = _capture_logger(monkeypatch, tools)
+
+    assert tools.run_make(str(tmp_path), 'aiesim') is True
+    assert any(str(tmp_path / 'aiesim.log') in m for lvl, m in lines if lvl == 'info')
+    assert not [m for lvl, m in lines if lvl == 'error']
+
+
 def test_next_step_does_not_offer_what_the_report_already_holds(tmp_path):
     """A hardware compile leaves the mapping behind without simulating, so the compile
     stage can already carry the tile memory the generic hint tells a user to go and get.
@@ -870,7 +898,6 @@ def test_oblique_estimate_carries_the_measured_tax(ydf_model, tmp_path):
                            model.n_features_padded, 1, model.W, 2, 4, 'latency')
     assert (model.estimate['est_cyc_per_sample']
             > 2 * axis['est_cyc_per_sample']), 'oblique must not be priced as axis-aligned'
-    assert any('tax' in v for v in model.estimate['validity'])
 
 
 def test_leaf_width_is_the_narrowest_that_holds_the_values(skl_model, tmp_path):

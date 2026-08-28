@@ -34,10 +34,14 @@ print(model.read_report())
 | `write()` | nothing | the project, the resolved mapping, and a forward cost estimate |
 | `compile()` | `aiecompiler` | that the project builds, for the x86 functional path |
 | `decision_function(X)` | `x86simulator` | scores, bit-accurate to the hardware arithmetic |
-| `build()` | `aiesimulator` | cycles: `cyc_per_sample`, `latency_ss_ns`, occupancy |
+| `build()` | `aiesimulator` | cycles: `cyc_per_sample`, `latency_ss_ns`, `slowest_tile_ratio` |
 
 `read_report()` returns whatever stage is on disk, with a `stage` key naming it and a
 `next_step` hint for the rest. It never fails for a stage that has not run.
+
+Each stage captures its tool output to `<target>.log` in the project directory -
+`x86sim_build.log`, `x86sim.log`, `aiesim.log` - and logs where it is. A stage that
+fails says so, names its log, and quotes the first error the tools reported.
 
 Tile placement, per-tile memory and program size come from `aiecompiler -target=hw`, which
 `build()` runs; the x86 compile produces no map report.
@@ -150,6 +154,12 @@ per-invocation setup is comparable to the per-tree work, so neither can be picke
 Auto only chooses vector widths the study measured. Wider ones build and the cost model
 prices them, but set `VectorWidth` explicitly to use one.
 
+## Reading the array's balance
+
+`slowest_tile_ratio` is the busiest tile's cycles over the average tile's. **1.0 is a
+perfectly balanced array**; 1.05 means the busiest tile does 5% more work than the
+average one, and the whole array waits for it. Sharding exists to keep it near 1.
+
 ## What `latency_ss` means
 
 The residence of one group: from the array accepting its first input word to its last
@@ -170,7 +180,5 @@ This is the steady-state residence, not the cold latency of a drained graph.
 `write()` reports `est_cyc_per_sample` and `est_latency_ss_ns` from a cost model fitted
 on VEK280 measurements. It reproduces every measured point of the
 study's width sweep - depths 4 to 6 at widths 8 to 32 - within 9%, and both tile-count
-anchors exactly. It is still an estimate, not a measurement, and carries a `validity`
-list naming every extrapolation in play — a depth or vector width outside the
-fitted range, or an oblique model, for which no cost law was fitted. Use `build()` for
-real numbers.
+anchors exactly. It is still an estimate, not a measurement: use `build()` for real
+numbers.

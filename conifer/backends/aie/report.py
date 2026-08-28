@@ -146,7 +146,8 @@ def _build_metrics(sim_dir, meta, report):
         cps = np.asarray([c['cyc'] for c in cores]) / n_samples
         report['cyc_per_sample'] = float(cps.max())
         report['cyc_per_sample_avg'] = float(cps.mean())
-        report['straggler_ratio'] = float(cps.max() / cps.mean()) if cps.mean() else None
+        # 1.0 is a perfectly balanced array; 1.05 means the busiest tile does 5% more.
+        report['slowest_tile_ratio'] = float(cps.max() / cps.mean()) if cps.mean() else None
         total = max(c['total'] for c in cores)
         report['total_cyc'] = total
         report['throughput_ns_per_sample'] = float(total / ghz / n_samples)
@@ -228,7 +229,7 @@ def _tree_split_latency(sim_dir, cores, per_call_ns, meta, report):
              for i in range(n)]
     if not (W and all(os.path.isfile(f) for f in files)):
         report['latency_ss_ns'] = float(per_call_ns.max())
-        report['latency_ss_note'] = 'approximated by the straggler invocation'
+        report['latency_ss_note'] = 'approximated by the slowest tile\'s invocation'
         return
 
     order = _tile_order(cores, n)

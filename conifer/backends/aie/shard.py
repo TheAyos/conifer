@@ -100,7 +100,7 @@ def search_span(tree_feats, n_trees, n_features, n_shards, seed=0, restarts=6,
 
 
 def refine(groups, fperm, tree_feats, n_features, rounds=6):
-    '''Descend on the straggler window by swapping trees, then feature positions
+    '''Descend on the widest tile window by swapping trees, then feature positions
 
     First-improvement and deterministic: layout only, so a worse result costs cycles and
     never correctness.
@@ -215,7 +215,8 @@ class Sharding:
         self.leaves = leaves[self.perm]
 
     @property
-    def straggler_rows(self):
+    def max_rows_per_tile(self):
+        '''Rows the busiest tile reads. What the array waits on, so what sharding cuts'''
         return max(self.n_feat)
 
     @property

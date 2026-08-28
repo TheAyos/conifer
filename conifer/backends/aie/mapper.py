@@ -14,13 +14,6 @@ _DEPTH_COST = {2: (107, 50.5),
                6: (125, 1150.5),
                }
 
-# Depths whose per_tree is extrapolated rather than fitted.
-_EXTRAPOLATED_DEPTHS = ()
-
-# The (depth, W) points the width sweep actually covered. Anything else is priced by the
-# mechanism rather than measured, and says so.
-_MEASURED_WIDTHS = {4: (16, 32), 5: (16, 32), 6: (8, 16, 32)}
-
 # Measured: W=32 wins throughput at every depth, W=16 wins latency at every depth. The
 # invocation is what latency pays and W is what throughput divides by, so they pull apart.
 _PRIORITY_W = {'latency': 16, 'throughput': 32}
@@ -154,7 +147,7 @@ def _register_scale(W, max_depth):
 def invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
     '''Cycles for one invocation, which scores W samples against tau trees
 
-    n_features is the straggler's row count, which sharding reduces. A memtile row is
+    n_features is the busiest tile's row count, which sharding reduces. A memtile row is
     two wide loads rather than sixteen stream reads, so the fill term nearly vanishes.
     '''
     base, per_tree = _DEPTH_COST[max_depth]
@@ -205,7 +198,7 @@ def _split_axis(priority):
 
 def _tau_for(n_trees, n_tiles, split_axis):
     # Sample-split gives every tile the whole ensemble; tree-split divides it, with the
-    # straggler taking the ceiling.
+    # busiest tile taking the ceiling.
     if split_axis == 'sample':
         return n_trees
     return int(math.ceil(n_trees / n_tiles))
@@ -213,7 +206,7 @@ def _tau_for(n_trees, n_tiles, split_axis):
 
 def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
              priority, oblique=False, feed='plio', split_axis=None):
-    '''Forward estimate for one mapping. An estimate, not a measurement: see validity
+    '''Forward estimate for one mapping
 
     split_axis is normally the priority's, because a priority IS a choice of axis. It is
     overridable so a REQUIREMENT can search both: given a rate to hold and a latency
@@ -226,30 +219,12 @@ def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
         inv *= _OBLIQUE_TAX
     samples_per_inv = W * (n_tiles if split_axis == 'sample' else 1)
 
-    validity = []
-    if max_depth in _EXTRAPOLATED_DEPTHS:
-        validity.append(f'per_tree at depth {max_depth} is extrapolated from the bitvector '
-                        'step, not fitted')
-    if W not in _MEASURED_WIDTHS.get(max_depth, ()):
-        measured = _MEASURED_WIDTHS.get(max_depth)
-        validity.append(
-            f'W={W} was not swept at depth {max_depth}'
-            + (f' (measured: {", ".join(str(w) for w in measured)})' if measured else '')
-            + '; the cost is modelled from the register counts, and has read ~18% '
-              'optimistic on cycles at the narrowest widths')
-    if feat_bytes != 2:
-        validity.append('the cost law was fitted at int16')
-    if oblique:
-        validity.append(f'the oblique cost is the axis-aligned law times the measured '
-                        f'{_OBLIQUE_TAX}x basis tax, not a law fitted on oblique kernels')
-
     return {'est_cyc_per_invocation': inv,
             'est_cyc_per_sample': inv / samples_per_inv,
             'est_latency_ss_ns': 1.1 * inv / AIE_CLOCK_GHZ,
             'est_throughput_ns_per_sample': inv / samples_per_inv / AIE_CLOCK_GHZ,
             'tau': tau,
             'split_axis': split_axis,
-            'validity': validity,
             }
 
 
@@ -298,7 +273,7 @@ def _requirement_candidates(n_trees, max_depth, n_features, feat_bytes, leaf_byt
 def meet_requirement(n_trees, max_depth, n_features, feat_bytes, leaf_bytes,
                      max_tiles, tile_memory_bytes, max_ns_per_sample=None,
                      max_latency_ns=None, oblique=False, feed='plio',
-                     n_tiles=None, W=None, allow_extrapolated=False):
+                     n_tiles=None, W=None):
     """The smallest mapping that holds a rate and stays inside a latency budget.
 
     Returns (n_tiles, W, split_axis, notes). Either requirement may be None, in which
@@ -309,12 +284,6 @@ def meet_requirement(n_trees, max_depth, n_features, feat_bytes, leaf_bytes,
     answer, and spending more to beat a requirement nobody stated is how a mapper ends up
     recommending sixty-four tiles for a model that fits on four.
 
-    THE PROMISE IS ONLY AS GOOD AS THE LAW UNDER IT. Every estimate carries a `validity`
-    list naming the extrapolations in play -- an unswept width, a precision the law was
-    not fitted at, an oblique model whose cost it understates. A point with a non-empty
-    list can still be right, but it cannot be PROMISED, so the search prefers a clean
-    point and returns a qualified one only when asked or when nothing clean meets the
-    requirement -- saying so either way.
     """
     if max_ns_per_sample is None and max_latency_ns is None:
         raise ValueError('meet_requirement needs a rate, a latency budget, or both')
@@ -339,11 +308,9 @@ def meet_requirement(n_trees, max_depth, n_features, feat_bytes, leaf_bytes,
                         leaf_bytes, oblique)
         return b['total'] <= tile_memory_bytes
 
-    ok = [c for c in cands if meets(c[3]) and fits(c[1])]
-    clean = [c for c in ok if not c[3]['validity']]
+    pool = [c for c in cands if meets(c[3]) and fits(c[1])]
     notes = []
 
-    pool = clean if (clean and not allow_extrapolated) else ok
     if not pool:
         # NOTHING MEETS IT, and saying WHICH HALF failed is most of the value of the
         # answer: a rate that cannot be held and a latency that cannot be met call for
@@ -381,11 +348,6 @@ def meet_requirement(n_trees, max_depth, n_features, feat_bytes, leaf_bytes,
                            best_lat[2], max_latency_ns))
         raise ValueError('; '.join(msg))
 
-    if not clean and ok:
-        notes.append('every mapping that meets this requirement rests on an '
-                     'extrapolation of the cost law, so what follows is an expectation '
-                     'and not a promise -- see validity')
-
     # Fewest tiles, then narrowest vector, then the better of the two on whichever
     # requirement was given. A deterministic order, so the same request maps the same way
     # twice.
@@ -405,7 +367,6 @@ def meet_requirement(n_trees, max_depth, n_features, feat_bytes, leaf_bytes,
             100 * (1 - e['est_latency_ss_ns'] / max_latency_ns)))
     notes.append('{} tile(s), W={}, {}-split meets the requirement with {}'.format(
         n, w, axis, ' and '.join(margin)))
-    notes.extend(e['validity'])
     return n, w, axis, notes
 
 
