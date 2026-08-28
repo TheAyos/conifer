@@ -54,7 +54,7 @@ namespace bdtmt {
 constexpr unsigned N_TILES = BDT_N_TILES;
 constexpr bool SPLIT_TREE = (BDT_SPLIT_TREE != 0);
 
-// Sample-split gives every tile the whole ensemble; only tree-split shards it.
+// Sample-split gives every tile the whole ensemble, only tree-split shards it.
 constexpr unsigned N_SHARDS = SPLIT_TREE ? N_TILES : 1u;
 constexpr unsigned DELTA = BDT_DELTA;
 constexpr bool FEED_PLIO = (BDT_FEED_PLIO != 0);
@@ -77,27 +77,20 @@ static_assert(
     "broadcast, per-tile PLIO and memtile are three feeds, not two flags");
 
 #if BDT_FEED_MEMTILE
-static_assert(
-    SPLIT_TREE && N_TILES > 1,
-    "the memtile feed writes one group for the whole array to share; a "
-    "sample-split tile holds different samples and shares nothing");
-static_assert(
-    BDT_SHARDED,
-    "FEED=memtile hands a tile a RANGE of rows, so the model must have been "
-    "sharded to say which range -- re-run gen/shard_model.py --assign span");
-static_assert(
-    bdtsh::WINDOWED,
-    "this sharding's rows are a SET, not a contiguous window, and a memtile "
-    "tiling cannot ask for a set. Use --assign span (ADR-0021 §5)");
+static_assert(SPLIT_TREE && N_TILES > 1,
+              "the memtile feed writes one group for the whole array to share, "
+              "a sample-split tile holds different samples and shares nothing");
+static_assert(BDT_SHARDED, "FEED=memtile hands a tile a range of rows, so the "
+                           "model must have been sharded");
+static_assert(bdtsh::WINDOWED,
+              "sharding's rows need to be contiguous for memtile");
 #endif
 
 constexpr double PLIO_RATE = BDT_PLIO_RATE; // MHz, on every input port
 
 static_assert(
     BDT_SHARDED || BDT_TAU != 0 || bdtm::N_TREES % N_SHARDS == 0,
-    "n_trees must divide evenly across the tiles; round 1 does not map "
-    "a ragged ensemble (ADR-0019). A SHARDED model is exempt: its tree counts "
-    "come from a generated table and are allowed to be ragged");
+    "n_trees must divide evenly across the tiles, except for sharded models");
 constexpr unsigned TAU =
     (BDT_TAU != 0) ? (unsigned)BDT_TAU : bdtm::N_TREES / N_SHARDS;
 static_assert(TAU <= bdtm::N_TREES, "tau exceeds the ensemble");
@@ -106,12 +99,10 @@ constexpr bool SHARDED = (BDT_SHARDED != 0);
 
 #if BDT_SHARDED
 static_assert(bdtsh::N_SHARDS == N_SHARDS,
-              "this model was sharded for a different tile count -- re-run "
-              "gen/shard_model.py with --tiles matching BDT_N_TILES");
-static_assert(
-    SPLIT_TREE || N_TILES == 1,
-    "sharding is a property of the TREE axis; a sample-split tile holds the "
-    "whole ensemble and therefore reads every feature");
+              "this model was sharded for a different tile count");
+static_assert(SPLIT_TREE || N_TILES == 1,
+              "sharding is a property of the tree axis. a sample-split tile "
+              "holds the whole ensemble and therefore reads every feature");
 #endif
 
 constexpr unsigned t_begin(unsigned shard) {
@@ -153,8 +144,7 @@ constexpr bool adds_init(unsigned shard) { return shard == 0; }
 } // namespace bdtmt
 
 static_assert(bdtm::N_SAMPLES % BDT_W == 0,
-              "N_SAMPLES must be a whole number of W-sample groups; "
-              "regenerate with --n-samples a multiple of W");
+              "N_SAMPLES must be a whole number of W-sample groups");
 static_assert(bdtmt::SPLIT_TREE ||
                   (bdtm::N_SAMPLES / BDT_W) % bdtmt::N_TILES == 0,
               "sample-split needs the group count to divide across the tiles");

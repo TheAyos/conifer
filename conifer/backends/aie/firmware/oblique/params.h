@@ -18,7 +18,7 @@
 #define BDT_SPLIT_TREE 0
 #endif
 
-// Samples a tile takes before the next tile's turn, under sample-split.
+// Samples a tile takes before the next tile's turn, under sample-split
 #ifndef BDT_DELTA
 #define BDT_DELTA BDT_W
 #endif
@@ -35,15 +35,9 @@ constexpr unsigned N_SHARDS = SPLIT_TREE ? N_TILES : 1u;
 constexpr unsigned DELTA = BDT_DELTA;
 constexpr double PLIO_RATE = BDT_PLIO_RATE;
 
-// An oblique node has a dense weight row and a basis over the global feature
-// set, so there is no per-shard feature frame to hand a tile: every tile reads
-// every row and the merge is the per-tile one. The memtile feed and span
-// sharding are axis-aligned only.
 constexpr unsigned TAU = bdtm::N_TREES / N_SHARDS;
-static_assert(
-    bdtm::N_TREES % N_SHARDS == 0,
-    "n_trees must divide evenly across the tiles; conifer's writer pads the "
-    "ensemble so that it does");
+static_assert(bdtm::N_TREES % N_SHARDS == 0,
+              "n_trees must divide evenly across the tiles");
 
 constexpr unsigned t_begin(unsigned shard) { return shard * TAU; }
 constexpr unsigned t_count(unsigned) { return TAU; }

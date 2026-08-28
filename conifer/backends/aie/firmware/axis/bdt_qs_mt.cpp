@@ -40,8 +40,6 @@ void bdt_qs_mt(input_stream<feat_t> *__restrict xin,
     writeincr(sout, score_shard<S>(xin));                                      \
   }
 
-// The payload role this build maps, and tile 0's, which may carry the tap.
-// Mirrors the header's BDT_DECL_ROLE exactly.
 #if BDT_FEED_MEMTILE
 #define BDT_DEF_ROLE(S) BDT_DEF_BUF(S)
 #else
@@ -49,9 +47,6 @@ void bdt_qs_mt(input_stream<feat_t> *__restrict xin,
 #endif
 #define BDT_DEF_ROLE0(S) BDT_DEF_ROLE(S)
 
-// The definitions this build maps, from the SAME generated ladder the header
-// declares from, so a declaration and its definition cannot disagree about a
-// tile's role.
 #define BDT_LADDER_DEF
 #include "tile_roles.h"
 #undef BDT_LADDER_DEF

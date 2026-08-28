@@ -16,14 +16,10 @@
 #endif
 #define BDT_DECL_ROLE0(S) BDT_DECL_ROLE(S)
 
-// Whole ensemble: N=1, and every tile of a sample-split (they differ only in
-// which samples arrive, so they share one symbol).
 void bdt_qs_mt(input_stream<bdtm::feat_t> *xin,
                output_stream<bdtm::score_t> *sout);
 
-// The ladder is generated per project (roles.py). A tile's tree range is baked
-// into its symbol, so the enumeration is unavoidable; writing it out by hand is
-// what made 64 a ceiling this device does not have.
+// generated per project by roles.py
 #define BDT_LADDER_DECL
 #include "tile_roles.h"
 #undef BDT_LADDER_DECL
