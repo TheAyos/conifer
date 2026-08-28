@@ -85,13 +85,9 @@ def check_n_classes(n_classes):
             f'regression models only, got n_classes={n_classes}')
 
 
-def check_n_tiles(n_tiles, oblique, device_tiles, plio_channels_out):
+def check_n_tiles(n_tiles, device_tiles, plio_channels_out):
     if n_tiles < 1:
         raise ValueError(f'n_tiles must be at least 1, got {n_tiles}')
-    if oblique and n_tiles > 1:
-        raise ValueError(
-            f'The aie backend has no multi-tile oblique kernel, so an oblique model needs '
-            f'n_tiles=1, got {n_tiles}')
     if n_tiles > device_tiles:
         raise ValueError(
             f'n_tiles {n_tiles} exceeds the {device_tiles} AI Engine tiles on this device')
@@ -110,11 +106,6 @@ def check_vector_width(W, feat_bytes):
         raise ValueError(
             f'W {W} must be a multiple of the {per_word} feature values in a 32-bit PLIO '
             f'word at this compare width')
-
-
-def check_n_features(n_features, oblique):
-    if n_features < 1:
-        raise ValueError(f'n_features must be at least 1, got {n_features}')
 
 
 def padded_n_features(n_features, oblique):

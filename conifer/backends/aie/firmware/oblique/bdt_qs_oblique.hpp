@@ -135,6 +135,9 @@ constexpr unsigned QT_LANES = qt_lanes();  // depth 4: 16, one 256-bit vector of
 
 constexpr unsigned QT_HALVES = (QT_LANES * BV_BITS > 1024u) ? 2u : 1u;
 constexpr unsigned QT_CHUNK  = QT_LANES / QT_HALVES;
+// The basis kernel has no chunked node loop. conifer's writer refuses the shapes that
+// would need one before emitting a project; this is the same refusal, one level down.
+static_assert(QT_HALVES == 1, "the basis kernel has no chunked node loop");
 
 static_assert(QT_CHUNK * BV_BITS <= 1024,
               "one chunk of a tree's bitvector run still exceeds a single "
@@ -177,9 +180,14 @@ static_assert(bdtm::QS_NODES_PER_TREE * bdtm::MAX_TERMS <= TERM_LANES,
               "one tree's term block no longer fits a single vector load; either "
               "chunk it the way QT_HALVES chunks the node tables, or widen this");
 
-template <typename LoadRow>
+// The tree range is a template parameter so a tile scores only its own shard. The basis
+// itself is NOT subsetted: it is built over the whole feature set on every tile, which is
+// the term tree-split does not divide.
+template <unsigned T_BEGIN, unsigned T_COUNT, bool ADD_INIT, typename LoadRow>
 __attribute__((always_inline))
 inline vscore qs_score_group(LoadRow load_row) {
+    static_assert(T_BEGIN + T_COUNT <= bdtm::N_TREES, "tree range runs off the ensemble");
+
     vfeat x[bdtm::N_FEATURES];
     for (unsigned k = 0; k < bdtm::N_FEATURES; k++) x[k] = load_row(k);
 
@@ -188,10 +196,13 @@ inline vscore qs_score_group(LoadRow load_row) {
 
     const vbvw keep_all = aie::broadcast<bvw_t, W>(~(bvw_t)0);
     vacc acc;
-    acc.from_vector(aie::broadcast<score_t, W>((score_t)bdtm::INIT_PREDICT));
+    // The ensemble's base score belongs to exactly one tile; added per shard it would
+    // be counted N times, silently and independently of shape.
+    acc.from_vector(aie::broadcast<score_t, W>(
+        (score_t)(ADD_INIT ? bdtm::INIT_PREDICT : 0)));
 
 #pragma unroll BDT_V2_UNROLL
-    for (unsigned h = 0; h < bdtm::N_TREES; h++) {
+    for (unsigned h = T_BEGIN; h < T_BEGIN + T_COUNT; h++) {
         vbvw v[BV_WORDS];
         if constexpr (BV_WORDS == 1) {
             v[0] = aie::broadcast<bvw_t, W>(bv_word(bdtm::INIT_V[h], 0));
@@ -203,60 +214,31 @@ inline vscore qs_score_group(LoadRow load_row) {
 
         const unsigned b = h * bdtm::QS_NODES_PER_TREE;
 
-        if constexpr (QT_HALVES == 1) {
-            const auto thr = aie::load_unaligned_v<QT_CHUNK>(&QT_THR_P[b]);
-            aie::vector<bvw_t, QT_CHUNK> bvv[BV_WORDS];
-            bvv[0] = aie::load_unaligned_v<QT_CHUNK>(&QT_BV_P[b]);
-            const auto bterm = aie::load_unaligned_v<TERM_LANES>(
-                    &bdtm::QT_BTERM[b * bdtm::MAX_TERMS]);
-            const auto bsign = aie::load_unaligned_v<TERM_LANES>(
-                    &bdtm::QT_BSIGN[b * bdtm::MAX_TERMS]);
+        const auto thr = aie::load_unaligned_v<QT_CHUNK>(&QT_THR_P[b]);
+        aie::vector<bvw_t, QT_CHUNK> bvv[BV_WORDS];
+        bvv[0] = aie::load_unaligned_v<QT_CHUNK>(&QT_BV_P[b]);
+        const auto bterm = aie::load_unaligned_v<TERM_LANES>(
+                &bdtm::QT_BTERM[b * bdtm::MAX_TERMS]);
+        const auto bsign = aie::load_unaligned_v<TERM_LANES>(
+                &bdtm::QT_BSIGN[b * bdtm::MAX_TERMS]);
 #pragma unroll
-            for (unsigned j = 0; j < bdtm::QS_NODES_PER_TREE; j++) {
-                vacc pa;
-                pa.from_vector(aie::zeros<feat_t, W>());
+        for (unsigned j = 0; j < bdtm::QS_NODES_PER_TREE; j++) {
+            vacc pa;
+            pa.from_vector(aie::zeros<feat_t, W>());
 #pragma unroll
-                for (unsigned t = 0; t < bdtm::MAX_TERMS; t++) {
-                    const unsigned l = j * bdtm::MAX_TERMS + t;
-                    // A pad term carries sign 0, so it adds nothing and the trip
-                    // count stays a compile-time constant with no guard.
-                    pa = aie::mac(pa, basis[bterm[l]], bsign[l]);
-                }
-                // No shift: the basis is already on the FX_SHIFT grid.
-                const vfeat p = pa.template to_vector<feat_t>(0);
-                const vmask m = bdtm::SPLIT_LE ? aie::gt(p, thr[j])
-                                               : aie::ge(p, thr[j]);
-                v[0] = aie::bit_and(v[0], aie::select(keep_all, bvv[0][j], m));
+            for (unsigned t = 0; t < bdtm::MAX_TERMS; t++) {
+                const unsigned l = j * bdtm::MAX_TERMS + t;
+                // A pad term carries sign 0, so it adds nothing and the trip
+                // count stays a compile-time constant with no guard.
+                pa = aie::mac(pa, basis[bterm[l]], bsign[l]);
             }
-        } else {
-#pragma unroll
-            for (unsigned c = 0; c < QT_HALVES; c++) {
-                const unsigned lo = c * QT_CHUNK;
-                const auto thr = aie::load_unaligned_v<QT_CHUNK>(&QT_THR_P[b + lo]);
-                aie::vector<bvw_t, QT_CHUNK> bvv[BV_WORDS];
-#pragma unroll
-                for (unsigned q = 0; q < BV_WORDS; q++)
-                    bvv[q] = aie::load_unaligned_v<QT_CHUNK>(
-                        &QT_BV_P[q * QT_STRIDE + b + lo]);
-
-#pragma unroll
-                for (unsigned j = 0; j < QT_CHUNK; j++) {
-                    if (lo + j < bdtm::QS_NODES_PER_TREE) {
-                        static_assert(QT_HALVES == 1,
-                                      "the basis kernel has no chunked node loop");
-                        const vfeat p = aie::zeros<feat_t, W>();
-                        const vmask m = bdtm::SPLIT_LE ? aie::gt(p, thr[j])
-                                                       : aie::ge(p, thr[j]);
-                        // Only the AND and the select multiply with the word count:
-                        // the compare is a property of the node, shared across words.
-#pragma unroll
-                        for (unsigned q = 0; q < BV_WORDS; q++)
-                            v[q] = aie::bit_and(
-                                v[q], aie::select(keep_all, bvv[q][j], m));
-                    }
-                }
-            }
+            // No shift: the basis is already on the FX_SHIFT grid.
+            const vfeat p = pa.template to_vector<feat_t>(0);
+            const vmask m = bdtm::SPLIT_LE ? aie::gt(p, thr[j])
+                                           : aie::ge(p, thr[j]);
+            v[0] = aie::bit_and(v[0], aie::select(keep_all, bvv[0][j], m));
         }
+
         acc = aie::add(acc, leaf_value(v, h));
     }
     return acc.template to_vector<score_t>();

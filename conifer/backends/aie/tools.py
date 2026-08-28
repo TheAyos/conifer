@@ -24,18 +24,6 @@ def get_tool_exe_in_path(tool):
     return tool_exe
 
 
-def get_aiecompiler():
-    return get_tool_exe_in_path('aiecompiler')
-
-
-def get_x86simulator():
-    return get_tool_exe_in_path('x86simulator')
-
-
-def get_aiesimulator():
-    return get_tool_exe_in_path('aiesimulator')
-
-
 def require_tools(*tools):
     '''Raise with an actionable message if any tool is not on the path'''
     missing = [t for t in tools if get_tool_exe_in_path(t) is None]

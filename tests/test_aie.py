@@ -71,7 +71,6 @@ def test_oblique_selects_the_oblique_family(ydf_model, tmp_path):
     model = conifer.converters.convert_from_ydf(ymodel, _oblique_config(tmp_path))
     model.write()
     assert model.family == 'oblique'
-    assert model.n_tiles == 1
     assert os.path.exists(tmp_path / 'src/bdt_qs_oblique.hpp')
 
 
@@ -159,12 +158,47 @@ def test_more_tiles_than_the_shim_can_route(skl_model, tmp_path):
         conifer.converters.convert_from_sklearn(clf, _config(tmp_path, NTiles=128))
 
 
-def test_oblique_rejects_multiple_tiles(ydf_model, tmp_path):
+def test_oblique_splits_across_tiles(ydf_model, tmp_path):
+    """The tree range is a template parameter, so a tile scores its own shard and the
+    ladder names one symbol per tile -- the same mechanism the axis-aligned fork uses.
+    """
     ymodel, _ = ydf_model
     cfg = _oblique_config(tmp_path)
     cfg['NTiles'] = 4
-    with pytest.raises(ValueError, match='multi-tile oblique'):
-        conifer.converters.convert_from_ydf(ymodel, cfg)
+    cfg['SplitAxis'] = 'tree'
+    model = conifer.converters.convert_from_ydf(ymodel, cfg)
+    model.write()
+    assert model.n_tiles == 4 and model.n_trees_padded % 4 == 0
+    ladder = (tmp_path / 'src/tile_roles.h').read_text()
+    assert 'bdt_qs_tile_3' in ladder
+
+
+def test_oblique_reads_a_partial_from_every_tile(ydf_model, tmp_path):
+    """Every tile emits its own partial on its own port, oblique included, so the reader
+    has to know there are n_tiles of them -- one output would silently score a fraction
+    of the ensemble.
+    """
+    ymodel, _ = ydf_model
+    cfg = _oblique_config(tmp_path)
+    cfg['NTiles'] = 4
+    cfg['SplitAxis'] = 'tree'
+    model = conifer.converters.convert_from_ydf(ymodel, cfg)
+    model.write()
+    assert model.n_outputs == 4
+
+
+def test_oblique_never_shards_or_takes_the_memtile(ydf_model, tmp_path):
+    """An oblique node has a dense weight row and a basis over the global feature set,
+    so there is no per-shard feature frame a memtile could hand a tile.
+    """
+    ymodel, _ = ydf_model
+    cfg = _oblique_config(tmp_path)
+    cfg['NTiles'] = 4
+    cfg['SplitAxis'] = 'tree'
+    cfg['Feed'] = 'memtile'
+    model = conifer.converters.convert_from_ydf(ymodel, cfg)
+    model.write()
+    assert model.sharding is None and model.feed_memtile is False
 
 
 @pytest.mark.parametrize('precision,match', [
@@ -812,7 +846,8 @@ def test_oblique_estimate_carries_the_measured_tax(ydf_model, tmp_path):
     ymodel, _ = ydf_model
     model = conifer.converters.convert_from_ydf(ymodel, _oblique_config(tmp_path))
     axis = mapper.estimate(model.tables.n_trees, model.tables.max_depth,
-                           model.n_features_padded, 1, model.W, 2, 4, 'latency')
+                           model.n_features_padded, model.n_tiles, model.W, 2, 4,
+                           'latency', split_axis=model.split_axis)
     assert (model.estimate['est_cyc_per_sample']
             > 2 * axis['est_cyc_per_sample']), 'oblique must not be priced as axis-aligned'
 

@@ -28,9 +28,6 @@ _MARGINAL_GAIN = 0.10
 _AUTO_TILE_CEILING = 16
 
 
-MIN_VECTOR_WIDTH = 8
-
-
 def tile_candidates(ceiling):
     """Powers of two up to a ceiling. The ladder is generated, so this follows the device."""
     out, n = [], 1
@@ -74,7 +71,7 @@ def _metric(priority):
 
 def choose_mapping(n_trees, max_depth, n_features, feat_bytes, leaf_bytes, priority,
                    max_tiles, tile_memory_bytes, oblique=False, feed='plio',
-                   n_tiles=None, W=None):
+                   n_tiles=None, W=None, basis_n=0):
     '''Pick the tile count and vector width together, on the metric the priority names
 
     They interact: a narrower vector is a smaller invocation, which helps latency only
@@ -84,8 +81,7 @@ def choose_mapping(n_trees, max_depth, n_features, feat_bytes, leaf_bytes, prior
     ceiling = max_tiles
     auto_ceiling = min(ceiling, _AUTO_TILE_CEILING)
 
-    tiles = [n_tiles] if n_tiles else (
-        [1] if oblique else tile_candidates(auto_ceiling))
+    tiles = [n_tiles] if n_tiles else tile_candidates(auto_ceiling)
     widths = [W] if W else list(AUTO_VECTOR_WIDTHS)
 
     key = _metric(priority)
@@ -95,7 +91,7 @@ def choose_mapping(n_trees, max_depth, n_features, feat_bytes, leaf_bytes, prior
             if w * feat_bytes % 4:
                 continue
             e = estimate(n_trees, max_depth, n_features, n, w, feat_bytes, leaf_bytes,
-                         priority, oblique, feed)
+                         priority, oblique, feed, basis_n=basis_n)
             if best_score is None or e[key] < best_score:
                 best, best_score = (n, w), e[key]
 
@@ -120,8 +116,16 @@ _REGISTER_BITS = 512
 # The share of per-tree work that does not scale with the bitvector's register count.
 _PER_TREE_FLOOR = 0.5
 
-# The oblique basis kernel's cost against an equally-shaped axis-aligned one, measured.
-_OBLIQUE_TAX = 2.73
+# THE OBLIQUE INVOCATION, MEASURED IN THREE TERMS rather than as one multiplier.
+#
+#   cyc/invocation = fixed + 11.9 * basis_n + 380 * tau
+#
+# The middle term is the signed pairs, built once per sample group over the whole feature
+# set. It is a property of the ENSEMBLE, not of the shard, so tree-split leaves it exactly
+# where it was and a single multiplier over the axis-aligned law would divide it too --
+# which is how a multi-tile oblique mapping ends up promised a speedup it cannot reach.
+_OBLIQUE_PER_TREE_TAX = 380.0 / 156.0
+_BASIS_CYC_PER_ENTRY = 11.9
 
 
 def _row_cycles(W, feat_bytes):
@@ -144,8 +148,8 @@ def _register_scale(W, max_depth):
     return _PER_TREE_FLOOR + (1.0 - _PER_TREE_FLOOR) * ratio
 
 
-def invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
-    '''Cycles for one invocation, which scores W samples against tau trees
+def _invocation_parts(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
+    '''(what one invocation pays whatever tau is, what it pays per tree)
 
     n_features is the busiest tile's row count, which sharding reduces. A memtile row is
     two wide loads rather than sixteen stream reads, so the fill term nearly vanishes.
@@ -155,7 +159,13 @@ def invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
     # The setup term scales with the group, like the rows do: measured fixed roughly
     # halves from W=32 to W=16.
     base *= W * feat_bytes / _FIT_BYTES
-    return base + n_features * row + per_tree * _register_scale(W, max_depth) * tau
+    return base + n_features * row, per_tree * _register_scale(W, max_depth) * tau
+
+
+def invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed='plio'):
+    '''Cycles for one invocation, which scores W samples against tau trees'''
+    fixed, trees = _invocation_parts(n_features, max_depth, tau, W, feat_bytes, feed)
+    return fixed + trees
 
 
 def _roundup(x, to):
@@ -166,8 +176,9 @@ def table_bytes(n_trees, max_depth, max_leaves, n_features, W, feat_bytes, leaf_
                 oblique, basis_n=0, max_terms=1):
     '''Tile data memory, mirroring the heap and stack the graph declares
 
-    Sharding is not implemented, so every tile carries the whole ensemble's tables and
-    this does not shrink with the tile count.
+    Every tile is handed the same generated tables and indexes its own tree range into
+    them, so this does not shrink with the tile count. Sharding cuts the feature rows a
+    tile reads, not the tables it holds.
     '''
     slots = n_trees * ((1 << max_depth) - 1)
     bv_bytes = bitvector_bits(max_depth) // 8
@@ -205,7 +216,7 @@ def _tau_for(n_trees, n_tiles, split_axis):
 
 
 def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
-             priority, oblique=False, feed='plio', split_axis=None):
+             priority, oblique=False, feed='plio', split_axis=None, basis_n=0):
     '''Forward estimate for one mapping
 
     split_axis is normally the priority's, because a priority IS a choice of axis. It is
@@ -214,9 +225,11 @@ def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
     '''
     split_axis = split_axis or _split_axis(priority)
     tau = _tau_for(n_trees, n_tiles, split_axis)
-    inv = invocation_cycles(n_features, max_depth, tau, W, feat_bytes, feed)
+    fixed, trees = _invocation_parts(n_features, max_depth, tau, W, feat_bytes, feed)
     if oblique:
-        inv *= _OBLIQUE_TAX
+        inv = fixed + _OBLIQUE_PER_TREE_TAX * trees + _BASIS_CYC_PER_ENTRY * basis_n
+    else:
+        inv = fixed + trees
     samples_per_inv = W * (n_tiles if split_axis == 'sample' else 1)
 
     return {'est_cyc_per_invocation': inv,
@@ -229,14 +242,11 @@ def estimate(n_trees, max_depth, n_features, n_tiles, W, feat_bytes, leaf_bytes,
 
 
 def choose_n_tiles(n_trees, max_depth, n_features, W, feat_bytes, leaf_bytes, priority,
-                   max_tiles, tile_memory_bytes, oblique=False):
+                   max_tiles, tile_memory_bytes, oblique=False, basis_n=0):
     '''Pick a tile count, and explain the choice. Returns (n_tiles, [notes])'''
     notes = []
     ceiling = max_tiles
     auto_ceiling = min(ceiling, _AUTO_TILE_CEILING)
-
-    if oblique:
-        return 1, ['the oblique kernel is single-tile']
 
     candidates = tile_candidates(ceiling)
 
@@ -254,9 +264,9 @@ def choose_n_tiles(n_trees, max_depth, n_features, W, feat_bytes, leaf_bytes, pr
                          'to keep compile time down, raise n_tiles for lower latency')
             break
         here = estimate(n_trees, max_depth, n_features, chosen, W, feat_bytes, leaf_bytes,
-                        priority)['est_latency_ss_ns']
+                        priority, oblique, basis_n=basis_n)['est_latency_ss_ns']
         there = estimate(n_trees, max_depth, n_features, n, W, feat_bytes, leaf_bytes,
-                         priority)['est_latency_ss_ns']
+                         priority, oblique, basis_n=basis_n)['est_latency_ss_ns']
         if here - there < _MARGINAL_GAIN * here:
             notes.append(f'stopping at {chosen} tiles: doubling to {n} buys '
                          f'{100 * (here - there) / here:.1f}%, under the '

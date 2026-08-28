@@ -6,7 +6,7 @@ import shutil
 import numpy as np
 from conifer.utils import copydocstring
 from conifer.backends.common import MultiPrecisionConfig
-from conifer.model import ModelBase, ConfigBase
+from conifer.model import ModelBase
 from conifer.backends.aie import checks, mapper, roles, shard as _shard, tables as _tables
 from conifer.backends.aie.precision import Precision, COMPARE_WIDTH, SCORE_WIDTH
 from conifer.backends.aie.devices import get_device_config
@@ -49,10 +49,6 @@ class AIEConfig(MultiPrecisionConfig):
     _aie_defaults = {'precision': _DEFAULT_COMPARE,
                      'score_precision': _DEFAULT_SCORE,
                      'priority': 'latency',
-                     # The long form: a rate to hold and a latency to stay inside,
-                     # instead of a preference between them. Both None means the
-                     # priority knob decides, which is every configuration written
-                     # before these existed.
                      'n_tiles': AUTO,
                      'split_axis': AUTO,
                      'vector_width': AUTO,
@@ -231,17 +227,21 @@ class AIEModel(ModelBase):
         self.priority = cfg.priority
         self.split_axis = (('tree' if self.priority == 'latency' else 'sample')
                            if cfg.split_axis == AUTO else cfg.split_axis)
-        want_feed = 'plio' if cfg.feed == 'plio' else 'memtile'
+        # An oblique node has a dense weight row and a basis over the global feature set,
+        # so there is no per-shard feature frame to hand a tile: the memtile feed and the
+        # sharding it carries are axis-aligned only.
+        want_feed = 'plio' if (cfg.feed == 'plio' or self.oblique) else 'memtile'
         feed = want_feed if self.split_axis == 'tree' else 'plio'
         n, W, notes = mapper.choose_mapping(
             self.tables.n_trees, d, self.n_features_padded,
             self.threshold_p.n_bytes, self.score_p.n_bytes, self.priority,
             self.device['n_tiles'], self.device['tile_memory_bytes'], self.oblique, feed,
             n_tiles=None if cfg.n_tiles == AUTO else int(cfg.n_tiles),
-            W=None if cfg.vector_width == AUTO else int(cfg.vector_width))
+            W=None if cfg.vector_width == AUTO else int(cfg.vector_width),
+            basis_n=self.basis['basis_n'] if self.oblique else 0)
         self.n_tiles, self.W, self._notes = n, W, notes
         checks.check_vector_width(self.W, self.threshold_p.n_bytes)
-        checks.check_n_tiles(self.n_tiles, self.oblique, self.device['n_tiles'],
+        checks.check_n_tiles(self.n_tiles, self.device['n_tiles'],
                              self.device.get('plio_channels_out'))
 
         self._finish_mapping(cfg)
@@ -249,9 +249,8 @@ class AIEModel(ModelBase):
     def _finish_mapping(self, cfg):
         '''Everything that follows from (n_tiles, W, split_axis), whichever chose them.
 
-        Split out so the requirement path and the priority path cannot drift: tau, the
-        null-tree padding, the batch size and the forward estimate are consequences of
-        the mapping and not of how it was picked.
+        tau, the null-tree padding, the batch size and the forward estimate are
+        consequences of the mapping and not of how it was picked.
         '''
         if self.split_axis == 'tree' and self.n_tiles > 1:
             self.tau = (int(math.ceil(self.tables.n_trees / self.n_tiles))
@@ -275,15 +274,14 @@ class AIEModel(ModelBase):
     def _set_estimate(self):
         rows = (self.sharding.max_rows_per_tile if getattr(self, 'sharding', None)
                 else self.n_features_padded)
-        # THE AXIS IS PASSED, not re-derived from the priority. Under the long form the
-        # two can differ -- a latency budget met by sample-split, say -- and an estimate
-        # that re-derived the axis would describe a graph this model is not building.
+        # The axis is passed, not re-derived from the priority: a user may pin it.
         self.estimate = mapper.estimate(
             self.n_trees_padded, self.tables.max_depth, rows,
             self.n_tiles, self.W, self.threshold_p.n_bytes, self.score_p.n_bytes,
             self.priority, self.oblique,
             'memtile' if getattr(self, 'feed_memtile', False) else 'plio',
-            split_axis=self.split_axis)
+            split_axis=self.split_axis,
+            basis_n=self.basis['basis_n'] if self.oblique else 0)
 
     def _leaf_bits(self, leaves_q):
         '''Narrowest int that holds every quantized leaf
@@ -499,19 +497,16 @@ class AIEModel(ModelBase):
         s.append(f'#define BDT_W {self.W}')
         s.append(f'#define BDT_PLIO_RATE {self.plio_rate}')
         s.append(f'#define XIN_FILE "{cfg.output_dir}/data/x.dat"')
+        s += [f'#define BDT_N_TILES {self.n_tiles}',
+              f'#define BDT_SPLIT_TREE {1 if self.split_axis == "tree" else 0}',
+              f'#define BDT_DELTA {self.delta}']
         if self.family == 'axis':
-            s += [f'#define BDT_N_TILES {self.n_tiles}',
-                  f'#define BDT_SPLIT_TREE {1 if self.split_axis == "tree" else 0}',
-                  f'#define BDT_MERGE_PLIO 1',
-                  f'#define BDT_FEED_PLIO 0',
+            s += [f'#define BDT_FEED_PLIO 0',
                   f'#define BDT_TAU {self.tau if self.split_axis == "tree" else 0}',
                   f'#define BDT_SHARDED {1 if self.sharding else 0}',
                   f'#define BDT_FEED_MEMTILE {1 if self.feed_memtile else 0}',
                   '#define BDT_MT_FANOUT 8',
-                  '#define BDT_MT_BUFFERS 2',
-                  '#define BDT_TAP 0',
-                  '#define BDT_PLACE 0',
-                  '#define BDT_MERGE_REDUCE 0']
+                  '#define BDT_MT_BUFFERS 2']
         s += ['', 'namespace bdtm {', '',
               f'typedef {self.threshold_p.c_type} feat_t;',
               f'typedef {self.score_p.c_type} score_t;',
@@ -638,8 +633,8 @@ class AIEModel(ModelBase):
 
     @property
     def n_outputs(self):
-        '''Output ports the graph declares: one per tile unless a cascade merges them'''
-        return self.n_tiles if self.family == 'axis' else 1
+        '''Output ports the graph declares: every tile emits its own partial'''
+        return self.n_tiles
 
     def _score_dir(self):
         for d in ('build_x86/x86simulator_output', 'build_hw/aiesimulator_output',
