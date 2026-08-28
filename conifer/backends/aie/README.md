@@ -60,10 +60,22 @@ what each returns.
 | `write()` | nothing | the project, the resolved mapping, and a forward cost estimate |
 | `compile()` | `aiecompiler` | that the project builds, for the x86 functional path |
 | `decision_function(X)` | `x86simulator` | scores, bit-accurate to the hardware arithmetic |
-| `build()` | `aiesimulator` | cycles: `cyc_per_sample`, `latency_ss_ns` (steady-state latency, below), `slowest_tile_ratio` |
+| `build(simulate=False)` | `aiecompiler` | the placement, tile memory and program memory of the mapped design |
+| `build(X)` | `aiesimulator` | that, plus cycles: `cyc_per_sample`, `latency_ss_ns` (steady-state latency, below), `slowest_tile_ratio`, and `X` scored |
 
 `read_report()` returns whatever stage is on disk, with a `stage` key naming it and a
 `next_step` hint for the rest. It never fails for a stage that has not run.
+
+`build()` runs two toolchain stages, and its arguments say which.
+`build(simulate=False)` stops after the hardware compile: the placement and the memory a
+tile needs, with no stimulus to supply and no cycle-accurate run to wait for. Expect a
+modest saving rather than a large one - on the sklearn example the compile is 430 s of the
+483 s a full `build()` costs, and the simulator about 50 s. The simulator is
+cycle-accurate, so its share grows with `NSamples` while the compile's does not.
+`build(X)` names the rows the cycle-accurate run scores; read them back with
+`read_scores(simulator='aie')`. With no `X` it simulates whatever `data/x.dat` holds, or
+zeros, and says which: the kernels are branch-free, so the timing does not depend on the
+data.
 
 Each stage captures its tool output to `<target>.log` in the project directory -
 `x86sim_build.log`, `x86sim.log`, `aiesim.log` - and logs where it is. A stage that
@@ -106,7 +118,7 @@ the mapping. Nothing chooses them and `resolved_config()` returns them unchanged
 | `Priority` | `latency` | `latency` splits trees across tiles; `throughput` splits samples. Also chooses the tile count and vector width |
 | `NTiles` | `auto` | 1 to the outgoing PLIO channels the platform routes (112 on `vek280_base`) |
 | `SplitAxis` | `auto` | `tree` or `sample` |
-| `VectorWidth` | `auto` | samples per invocation; auto chooses from 8, 16, 32 |
+| `VectorWidth` | `auto` | samples per invocation; auto fills a vector register, 32 for latency and 64 for throughput |
 | `PlioRate` | `auto` | offered input rate in MHz; at most half the array clock |
 | `TreesPerTile` | `auto` | how many trees each tile takes under tree-split |
 | `NSamples` | `auto` | rows the graph is compiled to score in one run |
@@ -125,7 +137,8 @@ ScorePrecision                                    ap_fixed<32,I,AP_RND_CONV,AP_S
 WeightPrecision                                   ap_fixed<16,I,AP_RND_CONV,AP_SAT>   (oblique only)
 ```
 
-`AP_RND_CONV,AP_SAT` is required because the kernels are bit-exact against that grid;
+`AP_RND_CONV,AP_SAT` is required because the tables are quantized round-half-to-even
+and saturating, and that mode is what names it;
 the `ap_fixed` default `AP_TRN,AP_WRAP` would score on a different one.
 
 ## Giving each tile less to read
@@ -236,13 +249,52 @@ model stay comparable.
 
 ## How auto chooses
 
-`Priority` fixes the split axis; the tile count and the vector width are then chosen
-together, on the metric the priority names, using the cost model below. They interact -
-a narrower vector is a smaller invocation, which helps latency only while the
-per-invocation setup is comparable to the per-tree work, so neither can be picked alone.
+`Priority` fixes two things directly and one through the cost model.
 
-Auto only chooses vector widths the study measured. Wider ones build and the cost model
-prices them, but set `VectorWidth` explicitly to use one.
+**The split axis** follows it: `latency` splits trees, `throughput` splits samples.
+
+**The vector width** follows it too, and is not searched. A group of `W` samples is one
+vector per feature, so `W` is just the register the priority wants divided by the compare
+width: **512 bits for latency, 1024 for throughput**, which at the mandatory 16-bit
+compare is `W=32` and `W=64`. A partly filled register wastes the lanes it does not use,
+and measurement says so on both arms. What varies is what a lane costs: the result
+bitvector is one bit per leaf, so a deeper ensemble wants a narrower group to fill the
+same register, and the measured winner flips exactly where the bitvector doubles.
+
+| depth | bits per lane | `W` for 512 bits | measured `latency_ss` |
+|---|---|---|---|
+| 4 | 16 | **32** | W=16 4316 ns, **W=32 4292 ns** |
+| 5 | 32 | **16** | **W=16 7979 ns**, W=32 10816 ns |
+
+Set `VectorWidth` to override.
+
+**The tile count** is the one the cost model chooses, by minimising whichever metric the
+priority names over the powers of two up to the auto ceiling.
+
+## The three per-sample numbers, and why they differ
+
+`build()` reports all three, and they are not the same quantity:
+
+| | what it counts | independent of `NSamples`? |
+|---|---|---|
+| `cyc_per_sample` | the kernel's own cycles, per score | yes, in steady state |
+| `throughput_ns_per_sample` | the steady-state invocation period, per score | yes, in steady state |
+| `run_ns_per_sample` | **every** cycle of the run, graph startup and teardown included | **no** |
+
+`throughput_ns_per_sample` is the period the array holds - one group's last output to the
+next group's - over the samples an invocation retires: `W` on a tree-split, `W x n_tiles`
+on a sample-split, which is what the estimate divides by too. Its excess over
+`cyc_per_sample` is reported as `io_ns_per_sample`, the time the array spends not
+computing. On the shipped examples that is a fraction of a nanosecond: these designs are
+compute-bound. It is a steady-state median against a whole-run mean, so on a short run it
+can come out slightly negative - that is the first invocation's transient sitting in
+`cyc_per_sample`, and it means no I/O cost is resolvable.
+
+**`run_ns_per_sample` is not a throughput.** Its excess over the kernel's own time is a
+fixed graph startup and teardown - 7300 to 9600 cycles whatever the model - so it falls as
+`NSamples` rises: on the sklearn example that constant adds 18.7 cyc/sample over 512
+samples and 62.7 over 128. **Two of them compare only at equal `NSamples`**, and neither
+compares against the estimate.
 
 ## Reading the array's balance
 
@@ -278,6 +330,8 @@ Two arms are weaker than the rest, both at narrow vectors. At `W=8` the fixed te
 under-predicted, so an axis-aligned estimate runs **optimistic** - 16% on cyc/sample and
 14% on latency for the example above - and a latency mapping is where auto picks a narrow
 vector. The oblique basis term is priced flat per entry from a `W=32` measurement and is
-cheaper at narrower vectors, so an oblique estimate runs **high** at small `W`, about 8%.
+cheaper at narrower vectors, so an oblique estimate runs **high** at small `W`. The error
+grows with the tile count, because the mispriced term is fixed while the tree work beside
+it is divided: +8% on one tile, +19% on sixteen.
 Both are sizing errors, not correctness ones: `build()` is where reported numbers come
 from.
