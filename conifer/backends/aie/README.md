@@ -89,9 +89,14 @@ its `tau` trees. It is the unit every cycle count on this page is built from.
 
 ## Configuration
 
-Any handle may be `'auto'`, in which case the backend chooses it and reports what it
-chose. `model.resolved_config()` returns the configuration with every `'auto'` filled
-in; passing that back reproduces the same project.
+The **mapping** handles - everything above `XilinxPart` - may be `'auto'`, in which case
+the backend chooses one and reports what it chose. `model.resolved_config()` returns the
+configuration with each filled in; passing that back reproduces the same project.
+`Priority` is the exception among them: it always holds a value, because it is what the
+others are chosen against.
+
+`XilinxPart`, `Platform` and `ElfgenJobs` name the target and the toolchain rather than
+the mapping. Nothing chooses them and `resolved_config()` returns them unchanged.
 
 | field | default | meaning |
 |---|---|---|
@@ -104,8 +109,8 @@ in; passing that back reproduces the same project.
 | `NSamples` | `auto` | rows the graph is compiled to score in one run |
 | `Shard` | `auto` | narrow each tile's feature rows to a window: `auto` searches the layout, `fast` uses a heuristic, `False` reads every row |
 | `Feed` | `auto` | `memtile` shares one input across the array; `plio` gives each tile a port |
-| `XilinxPart` | `xcve2802-vsvh1760-2MP-e-S` | selects the device record |
-| `Platform` | `auto` | `.xpfm` to build against; found from the Vitis environment when unset |
+| `XilinxPart` | `xcve2802-vsvh1760-2MP-e-S` | selects the device record: core count, tile memory, PLIO channels, clock. Read at `write()`, with or without a toolchain |
+| `Platform` | unset | overrides the `.xpfm` the toolchain builds against. The device record names one, so this is only for a custom or renamed platform, or an absolute path |
 | `ElfgenJobs` | unset | caps `aiecompiler` ELF generation fan-out |
 
 Precisions follow conifer's usual fields. The compare path must be 16 bits and the
