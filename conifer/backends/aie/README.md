@@ -6,24 +6,6 @@ Main tested target: VEK280 (`xcve2802`), AIE-MLv1, on Vitis 2026.1.
 
 Source `/path/to/Vitis/settings64.sh` to set up the Vitis environment. `PLATFORM_REPO_PATHS` can optionally be set. Both the `vek280_base` and `xilinx_vek280_base_<version>` layouts are detected. Set `Platform` to an `.xpfm` path to override.
 
-## Backend map
-
-    writer.py     AIEConfig, AIEModel, write(), compile(), build(),decision_function(), writes parameters.h
-    mapper.py     cost model + policy that picks tiles, width and axis
-    tables.py     node and leaf tables, derived from the conifer ensemble
-    shard.py      tree and feature assignement on tiles
-    precision.py  ap_fixed to integer width and binary point
-    checks.py     guards with detailed error messages
-    report.py     report reader
-    roles.py      per-tile kernel preprocessing directives writer
-    devices.py    device records (devices/*.json), independent of toolchain
-    platforms.py  locating a platform from the Vitis environment
-    tools.py      toolchain discovery, and running one Makefile target
-    firmware/     the vendored kernels: common/, axis/, oblique/
-    template/     the project Makefile
-
-`writer.py` owns the model class and calls everything else.
-
 ## Quick start
 
 ```python
@@ -42,6 +24,25 @@ print(model.read_report())
 ```
 
 Take a look at `examples/sklearn_to_aie.py` and `examples/ydf_to_aie.py`!
+
+## Backend map
+
+    writer.py     AIEConfig, AIEModel, write(), compile(), build(),decision_function(), writes parameters.h
+    mapper.py     cost model + policy that picks tiles, width and axis
+    tables.py     node and leaf tables, derived from the conifer ensemble
+    shard.py      tree and feature assignement on tiles
+    precision.py  ap_fixed to integer width and binary point
+    checks.py     guards with detailed error messages
+    report.py     report reader
+    roles.py      per-tile kernel preprocessing directives writer
+    devices.py    device records (devices/*.json), independent of toolchain
+    platforms.py  locating a platform from the Vitis environment
+    tools.py      toolchain discovery, and running one Makefile target
+    firmware/     the vendored kernels: common/, axis/, oblique/
+    template/     the project Makefile
+
+`writer.py` owns the model class and calls everything else.
+
 
 ## The four stages
 
@@ -70,77 +71,33 @@ One **invocation** is one call of a tile's kernel, scoring `VectorWidth` samples
 
 ## Configuration
 
-The **mapping** handles - everything above `XilinxPart` - may be `'auto'`, in which case
-the backend chooses one and reports what it chose. `model.resolved_config()` returns the
-configuration with each filled in; passing that back reproduces the same project.
-`Priority` is the exception among them: it always holds a value, because it is what the
-others are chosen against.
+Most mapping fields may be `'auto'`, in which case the backend chooses one and reports what it chose (`model.resolved_config()`).
 
-`XilinxPart`, `Platform` and `ElfgenJobs` name the target and the toolchain rather than
-the mapping. Nothing chooses them and `resolved_config()` returns them unchanged.
+`Priority` always holds a value, because the others are chosen against.
+
+`XilinxPart`, `Platform` and `ElfgenJobs` are for the toolchain and to be manually chosen.
 
 | field | default | meaning |
 |---|---|---|
-| `Priority` | `latency` | `latency` splits trees across tiles; `throughput` splits samples. Also chooses the tile count and vector width |
-| `NTiles` | `auto` | 1 to the outgoing PLIO channels the platform routes (112 on `vek280_base`) |
+| `Priority` | `latency` | `latency` splits trees across tiles, `throughput` splits samples. Impacts the tile count and vector width |
+| `NTiles` | `auto` | number of tiles to use |
 | `SplitAxis` | `auto` | `tree` or `sample` |
-| `VectorWidth` | `auto` | samples per invocation; auto fills a vector register, 32 for latency and 64 for throughput |
-| `PlioRate` | `auto` | offered input rate in MHz; at most half the array clock |
+| `VectorWidth` | `auto` | samples per invocation, auto fills a vector register or two depending on `Priority` |
+| `PlioRate` | `auto` | offered input rate in MHz, at most half the array clock |
 | `TreesPerTile` | `auto` | how many trees each tile takes under tree-split |
 | `NSamples` | `auto` | rows the graph is compiled to score in one run |
-| `Shard` | `auto` | narrow each tile's feature rows to a window: `auto` searches the layout, `fast` uses a heuristic, `False` reads every row |
-| `Feed` | `auto` | `memtile` shares one input across the array; `plio` gives each tile a port |
-| `XilinxPart` | `xcve2802-vsvh1760-2MP-e-S` | selects the device record: core count, tile memory, PLIO channels, clock. Read at `write()`, with or without a toolchain |
+| `Shard` | `auto` | narrow each tile's feature rows to a window, `auto` or `False` |
+| `Feed` | `auto` | `memtile` shares fewer PL inputs across the array, `plio` gives each tile a PL port |
+| `XilinxPart` | `xcve2802-vsvh1760-2MP-e-S` | selects the target device part (see AMD's documentation for more details)  |
 | `Platform` | unset | overrides the `.xpfm` the toolchain builds against. The device record names one, so this is only for a custom or renamed platform, or an absolute path |
-| `ElfgenJobs` | unset | caps `aiecompiler` ELF generation fan-out |
+| `ElfgenJobs` | unset | caps `aiecompiler` ELF generation concurrency |
+| `Precision` | `ap_fixed<16,5,AP_RND_CONV,AP_SAT>` | the compare path, and the fallback for the three below. Must be `ap_fixed<16,I,AP_RND_CONV,AP_SAT>` |
+| `InputPrecision` | `Precision` | the feature rows a tile reads |
+| `ThresholdPrecision` | `Precision` | the node thresholds they are compared against |
+| `WeightPrecision` | `Precision` | the projection weights, oblique only |
+| `ScorePrecision` | `ap_fixed<32,16,AP_RND_CONV,AP_SAT>` | the accumulator, which must hold the sum over all trees. Must be `ap_fixed<32,I,AP_RND_CONV,AP_SAT>` |
 
-Precisions follow conifer's usual fields. The compare path must be 16 bits and the
-accumulator 32, both with `AP_RND_CONV,AP_SAT`:
-
-```
-Precision / InputPrecision / ThresholdPrecision   ap_fixed<16,I,AP_RND_CONV,AP_SAT>
-ScorePrecision                                    ap_fixed<32,I,AP_RND_CONV,AP_SAT>
-WeightPrecision                                   ap_fixed<16,I,AP_RND_CONV,AP_SAT>   (oblique only)
-```
-
-`AP_RND_CONV,AP_SAT` is required because the tables are quantized round-half-to-even
-and saturating, and that mode is what names it;
-the `ap_fixed` default `AP_TRN,AP_WRAP` would score on a different one.
-
-## Giving each tile less to read
-
-Splitting trees across tiles divides the *work*, but not the *input*: by default every
-tile still reads every feature of every sample, and then waits on rows most of its trees
-never test.
-
-It does not have to. A tile's trees are fixed when the project is written, so the features
-those trees test are known too. The backend uses that twice - it chooses **which trees go
-on which tile**, and it **reorders the feature rows** - so that the features one tile
-needs end up next to each other. Each tile then reads a single contiguous window of rows
-instead of the whole sample. The code calls this *sharding*.
-
-Delivering different rows to different tiles needs the **memtile feed**: one input port
-writes each sample group into a shared buffer, and each tile reads only its own window out
-of it. A multicast PLIO cannot do it - every tile gets the same stream - so `Feed='plio'`
-declines the windowing along with the memtile.
-
-`write()` says what it achieved, and is honest when that is nothing:
-
-    sharded: each tile reads 13 of 16 feature rows at worst (46 across the array)
-
-Ten of ten would mean the trees on every tile touch every feature, so there was nothing to
-cut. Measured on VEK280 the memtile feed is better on latency, period, port count and
-balance at every tile count, whether or not the windowing saves rows.
-
-Sample-split never does this: such a tile holds the whole ensemble, so it reads every row
-regardless. `Shard=False` declines the windowing on its own.
-
-The tree assignment and the feature order are searched together, seeded so a build is
-reproducible; `Shard='fast'` takes a deterministic heuristic instead, at a few percent
-more rows.
-
-Every windowed model is checked before it is emitted: the per-tile partial scores are
-replayed and required to sum to exactly what the unwindowed tables score.
+`AP_RND_CONV,AP_SAT` is the only supported mode: the tables are quantized round-half-to-even and saturating.
 
 ## Kernels
 
@@ -149,93 +106,19 @@ replayed and required to sum to exactly what the unwindowed tables score.
 | axis-aligned | per-tree table layout, multi-tile | 1–112 |
 | oblique, weights in {0, ±1} | partial-projection basis, multi-tile | 1–112 |
 
-Both are written for this backend. Neither walks a tree: every node in a tile's trees is
-evaluated, each failing node clears the leaves it rules out from a per-tree bitmask, and
-the surviving lowest bit is the exit leaf. There are no data-dependent branches and no
-pointer chasing, which is what makes the work vectorize across samples.
+Neither kernel walks a tree. Every node in a tile's trees is evaluated, each failing node clears the leaves it rules out from a per-tree bitmask, and the surviving lowest bit is the exit leaf. No data-dependent branches and no pointer chasing, which is what makes the work vectorize across samples.
 
-That exit-leaf scheme is the one **QuickScorer** introduced (Lucchese et al., *QuickScorer:
-A Fast Algorithm to Rank Documents with Additive Ensembles of Regression Trees*, SIGIR
-2015), and the credit for it belongs there. Everything around it is this work: the
-vectorization across a sample group, the table layout, the multi-word bitmask that carries
-depth, the leaf select chain, the split across tiles, and the whole oblique path - the
-published algorithm is axis-aligned only and has no notion of a projection.
-
-An oblique split tests `w · x <= threshold`. Only binary ±1 projection weights are
-supported, which is what ydf's default `sparse_oblique_weights="BINARY"` emits.
-
-Tree-split divides an oblique ensemble as it divides an axis-aligned one, with one
-exception that governs how well it scales. Before testing any node, a tile builds the
-**basis**: the signed feature pairs every oblique split is expressed in. That is built
-once per sample group over the whole feature set, and it belongs to the ensemble rather
-than to any tile's share of it - so adding tiles divides the tree work and leaves the
-basis exactly where it was. It is what an oblique mapping saturates against, and the
-estimate prices it as its own term for that reason. Four tiles measured 2.58x, not 4x.
-
-An oblique model also reads every feature row on every tile, and takes the plain PLIO
-feed. Narrowing rows needs to know which features a tile's trees test; an oblique node
-tests a dense weight row over all of them, so there is nothing to narrow.
+That exit-leaf scheme is the one **QuickScorer** introduced (Lucchese et al., *QuickScorer: A Fast Algorithm to Rank Documents with Additive Ensembles of Regression Trees*, SIGIR 2015). We then built on top of it to vectorize across a sample group, the multi-word bitmask that carries depth, the leaf select chain, the split across tiles, and the oblique extension.
 
 ## Limits
 
 Raised at `write()`:
 
-- `max_depth > 6` — not supported yet
+- `max_depth > 6` not supported yet
 - oblique projection weights outside {0, ±1}
-- more than two classes — the kernels score one value per sample
-- `n_tiles` above the device's tile count, or above the outgoing PLIO channels the
-  platform routes: every tile emits its own partial score on its own channel, on both
-  split axes, and the outgoing side binds first
+- more than two classes, the kernels score one value per sample
+- `n_tiles` above the device's tile count, or above the outgoing PLIO channels the platform routes: every tile emits its own partial score on its own channel
 - unsupported precision width, rounding or overflow mode
-
-Warned, not raised:
-
-- estimated tile memory over budget — the AIE mapper has the final say
-- a score precision too narrow for `n_trees × max|leaf|`, which may saturate
-
-Padded, with an INFO message: oblique `n_features` up to a power of two, and the sample
-count up to a multiple of the vector width.
-
-## `n_samples` is a batch size
-
-The graph is compiled for a fixed number of rows, so `n_samples` is how many samples one
-run scores - a property of the project, not of the model.
-
-**`decision_function(X)` accepts any number of rows.** A shorter `X` is padded up to the
-batch; a longer one is split across as many runs as it needs. Either way you get exactly
-`len(X)` scores back, and an INFO line says what it cost - padding rows that are computed
-and discarded, or the number of runs - so `NSamples` can be set to match a known workload.
-
-`NSamples` itself also accepts any value: a run is a whole number of `W`-sample groups
-(and, under sample-split, of tiles), so a value that does not divide is rounded up rather
-than refused, with an INFO saying so.
-
-Auto holds the batch at one target across mappings so two configurations of the same
-model stay comparable.
-
-## How auto chooses
-
-`Priority` fixes two things directly and one through the cost model.
-
-**The split axis** follows it: `latency` splits trees, `throughput` splits samples.
-
-**The vector width** follows it too, and is not searched. A group of `W` samples is one
-vector per feature, so `W` is just the register the priority wants divided by the compare
-width: **512 bits for latency, 1024 for throughput**, which at the mandatory 16-bit
-compare is `W=32` and `W=64`. A partly filled register wastes the lanes it does not use,
-and measurement says so on both arms. What varies is what a lane costs: the result
-bitvector is one bit per leaf, so a deeper ensemble wants a narrower group to fill the
-same register, and the measured winner flips exactly where the bitvector doubles.
-
-| depth | bits per lane | `W` for 512 bits | measured `latency_ss` |
-|---|---|---|---|
-| 4 | 16 | **32** | W=16 4316 ns, **W=32 4292 ns** |
-| 5 | 32 | **16** | **W=16 7979 ns**, W=32 10816 ns |
-
-Set `VectorWidth` to override.
-
-**The tile count** is the one the cost model chooses, by minimising whichever metric the
-priority names over the powers of two up to the auto ceiling.
 
 ## Metrics
 
@@ -245,59 +128,31 @@ priority names over the powers of two up to the auto ceiling.
 |---|---|
 | `cyc_per_sample` | the kernel's own cycles, per score |
 | `throughput_ns_per_sample` | the steady-state invocation period, per score |
-| `run_ns_per_sample` | every cycle of the run, graph startup and teardown included |
+| `run_ns_per_sample` | `cyc_per_sample` + graph startup and teardown included. **Not a throughput**. |
+| `latency_ss_ns` | one group's residence, from the array accepting its first input word to its last score existing |
+| `slowest_tile_ratio` | the busiest tile's cycles over the average tile's. 1.0 means the array is balanced |
+| `est_cyc_per_sample`, `est_latency_ss_ns` | reported by `write()` from a cost model fitted on VEK280 measurements. It is still an estimate, use `build()` for real numbers. |
 
-`throughput_ns_per_sample` is the period the array holds - one group's last output to the
-next group's - over the samples an invocation retires: `W` on a tree-split, `W x n_tiles`
-on a sample-split, which is what the estimate divides by too. Its excess over
-`cyc_per_sample` is reported as `io_ns_per_sample`, the time the array spends not
-computing. On the shipped examples that is a fraction of a nanosecond: these designs are
-compute-bound. It is a steady-state median against a whole-run mean, so on a short run it
-can come out slightly negative - that is the first invocation's transient sitting in
-`cyc_per_sample`, and it means no I/O cost is resolvable.
+`throughput_ns_per_sample` is the period the array takes from one group's last output to the next group's, over the samples scored during an invocation: `W` on a tree-split, `W x n_tiles` on a sample-split, which is what the estimate divides by too. Its excess over `cyc_per_sample` is reported as `io_ns_per_sample`, the time the array spends not computing; on the shipped examples that is a fraction of a nanosecond, because these designs are compute-bound.
 
-**`run_ns_per_sample` is not a throughput.** Its excess over the kernel's own time is a
-fixed graph startup and teardown - 7300 to 9600 cycles whatever the model - so it falls as
-`NSamples` rises: on the sklearn example that constant adds 18.7 cyc/sample over 512
-samples and 62.7 over 128. **Two of them compare only at equal `NSamples`**, and neither
-compares against the estimate.
+`latency_ss_ns` is one group's residence in the array, from its first input word being accepted to its last score existing: under a tree-split every tile holds the same group, so it runs from the earliest tile accepting it to the last partial appearing. 
 
-## Reading the array's balance
+## Giving each tile less to read
 
-`slowest_tile_ratio` is the busiest tile's cycles over the average tile's. **1.0 is a
-perfectly balanced array**; 1.05 means the busiest tile does 5% more work than the
-average one, and the whole array waits for it. Narrowing each tile's rows, above,
-is what keeps it near 1.
+A tree-split divides the *work* but not the *input*: by default every tile reads every feature of every sample, then waits on rows most of its trees never test.
 
-## What `latency_ss` means
+A tile's trees are fixed when the project is written, so the features they test are known too. The backend chooses which trees go on which tile and reorders the feature rows, so each tile reads one contiguous window instead of the whole sample. The code calls this *sharding*, and `write()` says what it achieved:
 
-The residence of one group: from the array accepting its first input word to its last
-score existing. Under tree-split every tile holds the same group, so the array first
-held it when the earliest tile accepted it and the answer exists when the last partial
-does. Acceptance is reconstructed from each tile's own output, since an invocation
-begins by reading: `accepted = emitted - invocation`.
+    sharded: each tile reads 13 of 16 feature rows at worst (46 across the array)
 
-It is reported as the **intercept of a fit** over group index, not a mean, with the
-slope beside it as `latency_ss_drift_ns_per_group`. A pipelined mapping can hold a
-perfectly steady period while residence climbs, in which case the mean is a function of
-how long the run was and the intercept is not.
+Sample-split and oblique models never shard.
 
-This is the steady-state residence, not the cold latency of a drained graph.
+## `n_samples`
 
-## The estimate
+The graph is compiled for a fixed number of rows, so `n_samples` is a property of the project, not of the model (see it as a batch size). `decision_function(X)` still accepts any number of rows. A short `X` is padded, and a long one is split across runs. In both cases, the corresponding `len(X)` scores are returned.
 
-`write()` reports `est_cyc_per_sample` and `est_latency_ss_ns` from a cost model fitted
-on VEK280 measurements. It reproduces every measured point of the
-study's width sweep - depths 4 to 6 at widths 8 to 32 - within 9%, and both tile-count
-anchors exactly. It is still an estimate, not a measurement: use `build()` for real
-numbers.
+## How `auto` chooses
 
-Two arms are weaker than the rest, both at narrow vectors. At `W=8` the fixed term is
-under-predicted, so an axis-aligned estimate runs **optimistic** - 16% on cyc/sample and
-14% on latency for the example above - and a latency mapping is where auto picks a narrow
-vector. The oblique basis term is priced flat per entry from a `W=32` measurement and is
-cheaper at narrower vectors, so an oblique estimate runs **high** at small `W`. The error
-grows with the tile count, because the mispriced term is fixed while the tree work beside
-it is divided: +8% on one tile, +19% on sixteen.
-Both are sizing errors, not correctness ones: `build()` is where reported numbers come
-from.
+`Priority` fixes the split axis (`latency` splits trees, `throughput` splits samples) and the vector width. `W` is the group that fills a vector register, 512 bits for latency and 1024 for throughput, so a deeper ensemble takes a narrower group due to a wider leaf bitvector.
+
+The tile count is then the one minimising whichever metric the priority chooses, over powers of two. That is currently simpler than it sounds: nothing in the cost model gets worse with more tiles, so it always lands on as many as `auto` allows, capped to keep compile time down, with `NTiles` pinning any other count. We implement it as a search because the terms that would make more tiles worse (e.g., off-array summation, PLIO pressure, memtile bandwidth shared across readers) may be modelled in the future.
