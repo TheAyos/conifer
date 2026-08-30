@@ -1,4 +1,5 @@
 import logging
+
 logger = logging.getLogger(__name__)
 
 from conifer.backends.aie.writer import make_model, auto_config

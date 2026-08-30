@@ -38,14 +38,14 @@ Start at `writer.py`: it owns the model class and calls everything else.
 import conifer
 
 cfg = conifer.backends.aie.auto_config()
-cfg['OutputDir'] = 'prj_aie'
-cfg['Priority'] = 'latency'          # or 'throughput'
+cfg["OutputDir"] = "prj_aie"
+cfg["Priority"] = "latency"  # or 'throughput'
 
 model = conifer.converters.convert_from_sklearn(clf, cfg)
-model.write()                        # no toolchain needed
-model.compile()                      # aiecompiler
-y = model.decision_function(X)       # x86simulator
-model.build()                        # aiecompiler + aiesimulator
+model.write()  # no toolchain needed
+model.compile()  # aiecompiler
+y = model.decision_function(X)  # x86simulator
+model.build()  # aiecompiler + aiesimulator
 print(model.read_report())
 ```
 

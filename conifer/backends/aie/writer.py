@@ -917,7 +917,7 @@ class AIEModel(ModelBase):
 
     def _stimulus(self, X):
         """What the cycle-accurate run will score
-        
+
         The simulator reads its input from a file, and reports a missing one only after
         it has compiled the whole graph.
         """
