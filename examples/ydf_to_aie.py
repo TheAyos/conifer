@@ -106,6 +106,6 @@ print(f"  {report['cyc_per_sample']:.2f} cyc/sample on {report['n_active_cores']
 print(f"  {report['throughput_ns_per_sample']:.2f} ns/sample "
       f"({1e3 / report['throughput_ns_per_sample']:.1f} M samples/s)")
 print(f"  latency_ss {report['latency_ss_ns']:.1f} ns "
-      f"(drift {report['latency_ss_drift_ns_per_group']:.2f} ns/group)")
+      f"(simulation drift {report['latency_ss_drift_ns_per_group']:.2f} ns/group)")
 print(f"  slowest tile {report['slowest_tile_ratio']:.4f}x the average")
 print(f"  tile memory {report['tile_memory_bytes_max']} B of 65536")
