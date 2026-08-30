@@ -1,36 +1,28 @@
 # AI Engine backend
 
-Compiles a trained BDT to an AMD AI Engine project, using vectorized branch-free kernels
-mapped across one or more AIE tiles.
+Compiles a trained BDT to an AMD AI Engine project, using vectorized branch-free kernels mapped across one or more AIE tiles.
 
-Target: VEK280 (`xcve2802`), AIE-ML.
+Main tested target: VEK280 (`xcve2802`), AIE-MLv1, on Vitis 2026.1.
 
-Platforms are located from the Vitis environment, so sourcing `settings64.sh` is
-enough - `PLATFORM_REPO_PATHS` does not have to be set. Both the `vek280_base` and
-`xilinx_vek280_base_<version>` layouts are recognised. Set `Platform` to an `.xpfm`
-path to override.
+Source `/path/to/Vitis/settings64.sh` to set up the Vitis environment. `PLATFORM_REPO_PATHS` can optionally be set. Both the `vek280_base` and `xilinx_vek280_base_<version>` layouts are detected. Set `Platform` to an `.xpfm` path to override.
 
-## Where things are
+## Backend map
 
-This backend is larger than the other hardware ones because it has no HLS step to hand
-the hard problem to: `aiecompiler` places kernels but does not choose the parallelism,
-the data layout or the numeric grid, so the mapping is decided here.
-
-    writer.py     AIEConfig, AIEModel, and the four stages. Bulk-writes parameters.h
-    mapper.py     the cost model, and the policy that picks tiles, width and axis
-    tables.py     the node and leaf tables, derived from the conifer ensemble
-    shard.py      tree and feature assignment, so each tile reads a row window
-    precision.py  ap_fixed -> integer width and binary point
-    checks.py     the guards, each raising with what to change
-    report.py     the staged report reader
-    roles.py      the per-tile kernel symbol ladder, generated per project
-    devices.py    device records (devices/*.json), read without any toolchain
+    writer.py     AIEConfig, AIEModel, write(), compile(), build(),decision_function(), writes parameters.h
+    mapper.py     cost model + policy that picks tiles, width and axis
+    tables.py     node and leaf tables, derived from the conifer ensemble
+    shard.py      tree and feature assignement on tiles
+    precision.py  ap_fixed to integer width and binary point
+    checks.py     guards with detailed error messages
+    report.py     report reader
+    roles.py      per-tile kernel preprocessing directives writer
+    devices.py    device records (devices/*.json), independent of toolchain
     platforms.py  locating a platform from the Vitis environment
     tools.py      toolchain discovery, and running one Makefile target
     firmware/     the vendored kernels: common/, axis/, oblique/
     template/     the project Makefile
 
-Start at `writer.py`: it owns the model class and calls everything else.
+`writer.py` owns the model class and calls everything else.
 
 ## Quick start
 
@@ -49,58 +41,32 @@ model.build()  # aiecompiler + aiesimulator
 print(model.read_report())
 ```
 
-`examples/sklearn_to_aie.py` is the same thing end to end and runnable: it writes a
-project with no toolchain, and `--build` runs the three stages that need one and prints
-what each returns.
+Take a look at `examples/sklearn_to_aie.py` and `examples/ydf_to_aie.py`!
 
 ## The four stages
 
 | call | needs | gives |
 |---|---|---|
 | `write()` | nothing | the project, the resolved mapping, and a forward cost estimate |
-| `compile()` | `aiecompiler` | that the project builds, for the x86 functional path |
+| `compile()` | `aiecompiler` | the x86 functional correctness |
 | `decision_function(X)` | `x86simulator` | scores, bit-accurate to the hardware arithmetic |
 | `build(simulate=False)` | `aiecompiler` | the placement, tile memory and program memory of the mapped design |
-| `build(X)` | `aiesimulator` | that, plus cycles: `cyc_per_sample`, `latency_ss_ns` (steady-state latency, below), `slowest_tile_ratio`, and `X` scored |
+| `build(X)` | `aiesimulator` | above, plus cycles: `cyc_per_sample`, `latency_ss_ns`, `slowest_tile_ratio`, and `X` scored |
 
-`read_report()` returns whatever stage is on disk, with a `stage` key naming it and a
-`next_step` hint for the rest. It never fails for a stage that has not run.
+`read_report()` returns whatever stage is on disk.
 
-`build()` runs two toolchain stages, and its arguments say which.
-`build(simulate=False)` stops after the hardware compile: the placement and the memory a
-tile needs, with no stimulus to supply and no cycle-accurate run to wait for. Expect a
-modest saving rather than a large one - on the sklearn example the compile is 430 s of the
-483 s a full `build()` costs, and the simulator about 50 s. The simulator is
-cycle-accurate, so its share grows with `NSamples` while the compile's does not.
-`build(X)` names the rows the cycle-accurate run scores; read them back with
-`read_scores(simulator='aie')`. With no `X` it simulates whatever `data/x.dat` holds, or
-zeros, and says which: the kernels are branch-free, so the timing does not depend on the
-data.
+`build(simulate=False)` stops after the hardware compile: the placement and the memory a tile needs, with no stimulus to supply and no cycle-accurate run to wait for. The simulator is cycle-accurate, so its share grows with `NSamples` while the compile's does not.
+`build(X)` (`simulate=True` is the default) compiles and launches the cycle-accurate run, computing scores. Read them back with `read_scores(simulator='aie')`. With no `X` it simulates whatever `data/x.dat` holds, or zeros (the timing does not depend on the data).
 
-Each stage captures its tool output to `<target>.log` in the project directory -
-`x86sim_build.log`, `x86sim.log`, `aiesim.log` - and logs where it is. A stage that
-fails says so, names its log, and quotes the first error the tools reported.
+## Definitions
 
-Tile placement, per-tile memory and program size come from `aiecompiler -target=hw`, which
-`build()` runs; the x86 compile produces no map report.
+- **tile** - one AI Engine core, with its own program and 64 kB of data memory. A VEK280 has 304 of them.
+- **PLIO** - the stream ports between the array and the rest of the chip. They are a scarcer resource than the cores (VEK280 has 112 outgoing ones).
+- **memtile** - a shared on-chip buffer that several tiles can read from, each at its own offset. It is how different tiles can get different data from one input port.
+- **tree-split** - use more tiles by giving each a subset of the trees. Every tile sees every sample and emits a partial score, and the partials are summed off-array. Shortens latency.
+- **sample-split** - use more tiles by giving each a subset of the samples, with the whole ensemble on each. Nothing to sum. Raises throughput.
 
-## The vocabulary
-
-Five words the rest of this page assumes, none of them conifer's:
-
-- **tile** - one AI Engine core, with its own program and 64 kB of data memory. A VEK280
-  has 304 of them.
-- **PLIO** - the stream ports between the array and the rest of the chip. They are a
-  scarcer resource than the cores: this platform routes 112 outgoing ones.
-- **memtile** - a shared on-chip buffer that several tiles can read from, each at its own
-  offset. It is how different tiles get *different* data from one input port.
-- **tree-split** - use more tiles by giving each a subset of the trees. Every tile sees
-  every sample and emits a partial score, and the partials are summed. Shortens latency.
-- **sample-split** - use more tiles by giving each a subset of the *samples*, with the
-  whole ensemble on each. Nothing to sum. Raises throughput.
-
-One **invocation** is one call of a tile's kernel, scoring `VectorWidth` samples against
-its share of the trees. It is the unit every cycle count on this page is built from.
+One **invocation** is one call of a tile's kernel, scoring `VectorWidth` samples against its share of the trees.
 
 ## Configuration
 
@@ -271,15 +237,15 @@ Set `VectorWidth` to override.
 **The tile count** is the one the cost model chooses, by minimising whichever metric the
 priority names over the powers of two up to the auto ceiling.
 
-## The three per-sample numbers, and why they differ
+## Metrics
 
-`build()` reports all three, and they are not the same quantity:
+`build()` reports:
 
-| | what it counts | independent of `NSamples`? |
-|---|---|---|
-| `cyc_per_sample` | the kernel's own cycles, per score | yes, in steady state |
-| `throughput_ns_per_sample` | the steady-state invocation period, per score | yes, in steady state |
-| `run_ns_per_sample` | **every** cycle of the run, graph startup and teardown included | **no** |
+| | what it counts |
+|---|---|
+| `cyc_per_sample` | the kernel's own cycles, per score |
+| `throughput_ns_per_sample` | the steady-state invocation period, per score |
+| `run_ns_per_sample` | every cycle of the run, graph startup and teardown included |
 
 `throughput_ns_per_sample` is the period the array holds - one group's last output to the
 next group's - over the samples an invocation retires: `W` on a tree-split, `W x n_tiles`

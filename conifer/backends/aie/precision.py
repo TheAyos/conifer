@@ -18,7 +18,7 @@ REQUIRED_OVERFLOW = "AP_SAT"
 
 _AP_FIXED = re.compile(r"^\s*ap_(u?)fixed\s*<([^>]*)>\s*$")
 
-
+# TODO: quantize() add support for other types
 class Precision:
     """One conifer ap_fixed type, as the kernels need it: a width and a binary point"""
 
