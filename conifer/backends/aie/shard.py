@@ -1,39 +1,58 @@
-import random
-import numpy as np
 import logging
+import random
+
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
 def tree_feature_sets(tables, n_trees, nodes_per_tree):
-    '''Features each tree tests. Padding slots hold feature 0 and must be skipped'''
+    """Features each tree tests. Padding slots hold feature 0 and must be skipped"""
     n = n_trees * nodes_per_tree
     used = list(tables.qt_used) + [False] * (n - len(tables.qt_used))
     group = list(tables.qt_group) + [0] * (n - len(tables.qt_group))
-    return [frozenset(group[h * nodes_per_tree + j]
-                      for j in range(nodes_per_tree) if used[h * nodes_per_tree + j])
-            for h in range(n_trees)]
+    return [
+        frozenset(
+            group[h * nodes_per_tree + j]
+            for j in range(nodes_per_tree)
+            if used[h * nodes_per_tree + j]
+        )
+        for h in range(n_trees)
+    ]
 
 
 def assign_contiguous(n_trees, n_shards):
     trees_per_tile = n_trees // n_shards
-    return [list(range(s * trees_per_tile, (s + 1) * trees_per_tile)) for s in range(n_shards)]
+    return [
+        list(range(s * trees_per_tile, (s + 1) * trees_per_tile))
+        for s in range(n_shards)
+    ]
 
 
 def feature_permutation(groups, tree_feats, n_features, sweeps=20):
-    '''Order feature rows so each shard's form a near-contiguous window
-
-    A barycenter sweep: deterministic, no search, and it recovers most of the rows an
-    identity order leaves on the table.
-    '''
-    shard_feats = [frozenset().union(*[tree_feats[h] for h in g]) if g else frozenset()
-                   for g in groups]
-    owners = [[s for s, fs in enumerate(shard_feats) if f in fs] for f in range(n_features)]
+    """Order feature rows so each shard's form a near-contiguous window"""
+    shard_feats = [
+        frozenset().union(*[tree_feats[h] for h in g]) if g else frozenset()
+        for g in groups
+    ]
+    owners = [
+        [s for s, fs in enumerate(shard_feats) if f in fs] for f in range(n_features)
+    ]
     fperm = list(range(n_features))
     for _ in range(sweeps):
         pos = {f: p for p, f in enumerate(fperm)}
-        centre = [sum(pos[f] for f in fs) / len(fs) if fs else 0.0 for fs in shard_feats]
-        key = [(sum(centre[s] for s in owners[f]) / len(owners[f]) if owners[f]
-                else float('inf'), f) for f in range(n_features)]
+        centre = [
+            sum(pos[f] for f in fs) / len(fs) if fs else 0.0 for fs in shard_feats
+        ]
+        key = [
+            (
+                sum(centre[s] for s in owners[f]) / len(owners[f])
+                if owners[f]
+                else float("inf"),
+                f,
+            )
+            for f in range(n_features)
+        ]
         nxt = sorted(range(n_features), key=lambda f: key[f])
         if nxt == fperm:
             break
@@ -55,15 +74,14 @@ def _cost(groups, tree_feats, fperm):
     return (max(w), sum(w))
 
 
-def search_span(tree_feats, n_trees, n_features, n_shards, seed=0, restarts=6,
-                iters=None):
+def search_span(
+    tree_feats, n_trees, n_features, n_shards, seed=0, restarts=6, iters=None
+):
     """Assign trees and permute features together, minimising the window
 
     A memtile hands a tile a contiguous range of rows, so the only way to make a shard's
-    rows contiguous is to choose the order they are written in. Seeded, so a build is
-    reproducible.
+    rows contiguous is to choose the order they are written in
     """
-    # Scaled to the neighbourhood: a small model converges long before 120k moves.
     if iters is None:
         iters = min(120_000, max(6_000, 400 * (n_trees + n_features * n_shards)))
     rng = random.Random(seed)
@@ -72,7 +90,10 @@ def search_span(tree_feats, n_trees, n_features, n_shards, seed=0, restarts=6,
     for _ in range(restarts):
         order = list(range(n_trees))
         rng.shuffle(order)
-        g = [order[s * trees_per_tile:(s + 1) * trees_per_tile] for s in range(n_shards)]
+        g = [
+            order[s * trees_per_tile : (s + 1) * trees_per_tile]
+            for s in range(n_shards)
+        ]
         fperm = list(range(n_features))
         rng.shuffle(fperm)
         cur = _cost(g, tree_feats, fperm)
@@ -100,11 +121,7 @@ def search_span(tree_feats, n_trees, n_features, n_shards, seed=0, restarts=6,
 
 
 def refine(groups, fperm, tree_feats, n_features, rounds=6):
-    '''Descend on the widest tile window by swapping trees, then feature positions
-
-    First-improvement and deterministic: layout only, so a worse result costs cycles and
-    never correctness.
-    '''
+    """Descend on the widest tile window by swapping trees, then feature positions"""
     groups = [list(g) for g in groups]
     fperm = list(fperm)
     best = _cost(groups, tree_feats, fperm)
@@ -134,14 +151,23 @@ def refine(groups, fperm, tree_feats, n_features, rounds=6):
 
 
 class Sharding:
-    '''Trees assigned to tiles, with each tile's feature rows a contiguous window
+    """Trees assigned to tiles, with each tile's feature rows a contiguous window
 
     QT_FEAT[h] is read only by the tile owning tree h, so one table can be interpreted
-    in a different local feature frame per shard.
-    '''
+    in a different local feature frame per shard
+    """
 
-    def __init__(self, tables, n_trees, n_features, n_shards, groups=None, fperm=None,
-                 optimize='search', seed=0):
+    def __init__(
+        self,
+        tables,
+        n_trees,
+        n_features,
+        n_shards,
+        groups=None,
+        fperm=None,
+        optimize="search",
+        seed=0,
+    ):
         self.tables = tables
         self.n_trees = n_trees
         self.n_features = n_features
@@ -150,20 +176,25 @@ class Sharding:
 
         self.tree_feats = tree_feature_sets(tables, n_trees, self.nodes_per_tree)
         chosen = groups is None and fperm is None and n_shards > 1
-        if chosen and optimize == 'search':
-            self.groups, self.fperm = search_span(self.tree_feats, n_trees, n_features,
-                                                  n_shards, seed=seed)
+        if chosen and optimize == "search":
+            self.groups, self.fperm = search_span(
+                self.tree_feats, n_trees, n_features, n_shards, seed=seed
+            )
         else:
             self.groups = groups or assign_contiguous(n_trees, n_shards)
-            self.fperm = list(fperm) if fperm else feature_permutation(
-                self.groups, self.tree_feats, n_features)
+            self.fperm = (
+                list(fperm)
+                if fperm
+                else feature_permutation(self.groups, self.tree_feats, n_features)
+            )
             if chosen and optimize:
-                self.groups, self.fperm = refine(self.groups, self.fperm,
-                                                 self.tree_feats, n_features)
+                self.groups, self.fperm = refine(
+                    self.groups, self.fperm, self.tree_feats, n_features
+                )
         if sorted(h for g in self.groups for h in g) != list(range(n_trees)):
-            raise ValueError('the tree assignment is not a partition of the ensemble')
+            raise ValueError("the tree assignment is not a partition of the ensemble")
         if sorted(self.fperm) != list(range(n_features)):
-            raise ValueError('the feature permutation is not a permutation')
+            raise ValueError("the feature permutation is not a permutation")
 
         self.perm = [h for g in self.groups for h in g]
         self.t_count = [len(g) for g in self.groups]
@@ -178,7 +209,7 @@ class Sharding:
         self.feats, self.offset = [], []
         for g in self.groups:
             pos = sorted({inv[f] for h in g for f in self.tree_feats[h]})
-            # An all-null shard still needs one row: the kernel asserts N_FEAT > 0.
+            # an all-null shard still needs one row
             if not pos:
                 pos = [0]
             lo, hi = pos[0], pos[-1]
@@ -201,8 +232,6 @@ class Sharding:
             loc = local[self.owner[new_h]]
             for j in range(P):
                 i = old_h * P + j
-                # An unused slot's global feature need not be in this shard's window,
-                # and its all-ones bitvector makes the compare inert.
                 self.qt_group.append(loc[base_group[i]] if base_used[i] else 0)
                 self.qt_thr_f.append(base_thr[i])
                 self.qt_bv.append(base_bv[i])
@@ -211,27 +240,40 @@ class Sharding:
         init_v = list(t.init_v) + [all_ones] * (self.n_trees - len(t.init_v))
         self.init_v = [init_v[h] for h in self.perm]
         leaves = np.zeros((self.n_trees, t.max_leaves), dtype=np.float64)
-        leaves[:len(t.leaves)] = t.leaves
+        leaves[: len(t.leaves)] = t.leaves
         self.leaves = leaves[self.perm]
 
     @property
     def max_rows_per_tile(self):
-        '''Rows the busiest tile reads. What the array waits on, so what sharding cuts'''
+        """Rows the busiest tile reads"""
         return max(self.n_feat)
 
     @property
     def total_rows(self):
         return sum(self.n_feat)
 
-    def verify(self, X, threshold_precision, score_precision, init_predict, norm=1.0,
-               split_le=True):
-        '''Replay the sharded model and require it to equal the unsharded one exactly
+    def verify(
+        self,
+        X,
+        threshold_precision,
+        score_precision,
+        init_predict,
+        norm=1.0,
+        split_le=True,
+    ):
+        """Replay the sharded model and require it to equal the unsharded one exactly
 
-        Sums partial scores the way the array does, each shard from its own cut of the
+        Sums partial scores the way the AIE array does, each shard from its own cut of the
         rows, so the permutation, the local frames and the row windows are all checked.
-        '''
-        base = self.tables.replay(X, threshold_precision, score_precision, init_predict,
-                                  norm=norm, split_le=split_le)
+        """
+        base = self.tables.replay(
+            X,
+            threshold_precision,
+            score_precision,
+            init_predict,
+            norm=norm,
+            split_le=split_le,
+        )
         thr_q = threshold_precision.quantize(np.asarray(self.qt_thr_f))
         leaves_q = score_precision.quantize(self.leaves * norm)
         init_q = int(score_precision.quantize([float(init_predict) * norm])[0])
@@ -247,8 +289,11 @@ class Sharding:
                     v = self.init_v[new_h]
                     for j in range(P):
                         i = new_h * P + j
-                        if thr_q[i] < int(x[self.qt_group[i]]) if split_le \
-                                else thr_q[i] <= int(x[self.qt_group[i]]):
+                        if (
+                            thr_q[i] < int(x[self.qt_group[i]])
+                            if split_le
+                            else thr_q[i] <= int(x[self.qt_group[i]])
+                        ):
                             v &= self.qt_bv[i]
                     acc += int(leaves_q[new_h][(v & -v).bit_length() - 1])
                 total[si] += acc

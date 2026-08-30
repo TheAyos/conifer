@@ -15,8 +15,6 @@ constexpr unsigned BV_WORDS = (bdtm::MAX_LEAVES + BV_BITS - 1) / BV_BITS;
 
 using vbvw = aie::vector<bvw_t, W>;
 
-// Word q of a bitvector, at compile time. The argument widens to uint64
-// whatever bv_t is, so the shift is defined at every depth.
 constexpr bvw_t bv_word(uint64_t v, unsigned q) {
   return (bvw_t)((v >> (BV_BITS * q)) & (bvw_t) ~(bvw_t)0);
 }
@@ -83,8 +81,7 @@ __attribute__((always_inline)) inline vleaf mux(const vrow &row,
   constexpr unsigned BIT = log2_of(N) - 1;
   if constexpr (N == 2) {
     // The bottom level takes its two candidates as elements of a vector already
-    // in a register, so the pair collapses to one vector with no scalar load at
-    // all.
+    // in a register, so the pair collapses to one vector, avoiding scalar load
     return aie::select(row[Lo], row[Lo + 1], mbit[BIT]);
   } else {
     const vleaf lo = mux<Lo, N / 2>(row, mbit);
@@ -108,8 +105,8 @@ __attribute__((always_inline)) inline vleaf leaf_value(const vbvw v[BV_WORDS],
     const vmask lower_wins = aie::neq(v[q], (bvw_t)0);
     lsb = aie::select(lsb, lsbq, lower_wins);
   }
-  // Which word won, as index bits above the in-word ones. With BV_WORDS == 2
-  // this is a single bit: set iff word 0 was empty.
+  // Which word won, as index bits above the in-word ones. With BV_WORDS at 2,
+  // this is a single bit that is set iff word 0 was empty.
 #pragma unroll
   for (unsigned p = 0; p + IN_WORD_BITS < log2_leaves(); p++) {
     vmask m = aie::eq(v[0], (bvw_t)0); // only the two-word case is reachable
@@ -225,8 +222,6 @@ __attribute__((always_inline)) inline vscore qs_score_group(LoadRow load_row) {
             const vmask m = bdtm::SPLIT_LE
                                 ? aie::gt(x[bdtm::QT_FEAT[b + lo + j]], thr[j])
                                 : aie::ge(x[bdtm::QT_FEAT[b + lo + j]], thr[j]);
-            // Only the AND and the select multiply with the word count:
-            // the compare is a property of the node, shared across words.
 #pragma unroll
             for (unsigned q = 0; q < BV_WORDS; q++)
               v[q] = aie::bit_and(v[q], aie::select(keep_all, bvv[q][j], m));

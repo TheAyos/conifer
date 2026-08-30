@@ -35,16 +35,15 @@ def require_tools(*tools):
             f'script (settings64.sh) for a release with AI Engine support')
 
 
-# The tools finish with a tally like "(WARNING:3, CRITICAL-WARNING:0, ERROR:0)", which
-# contains the word and reports none.
-_TALLY = re.compile(r'CRITICAL-WARNING|ERROR:\s*0\b')
+# The tools finish with a log like "(WARNING:3, CRITICAL-WARNING:0, ERROR:0)"
+_LOG_LINE = re.compile(r'CRITICAL-WARNING|ERROR:\s*0\b')
 
 
 def _first_error(log_path):
     try:
         with open(log_path, errors='ignore') as f:
             for line in f:
-                if ('ERROR' in line or 'error:' in line) and not _TALLY.search(line):
+                if ('ERROR' in line or 'error:' in line) and not _LOG_LINE.search(line):
                     return line.strip()[:300]
     except OSError:
         pass
@@ -65,16 +64,12 @@ def run_make(output_dir, target, **variables):
 
     start = datetime.datetime.now()
     logger.info(f'{target} starting {start:%H:%M:%S}')
-    # subprocess rather than os.system: system(3) ignores SIGINT for the child's
-    # lifetime, so a Ctrl-C during a build that runs for minutes came back as a
-    # toolchain failure instead of stopping the interpreter.
     with open(log_path, 'w') as log:
         rc = subprocess.call(cmd, shell=True, stdout=log, stderr=subprocess.STDOUT)
     stop = datetime.datetime.now()
     logger.info(f'{target} finished {stop:%H:%M:%S} - took {str(stop - start)}, '
                 f'log in {log_path}')
 
-    # A signal death is a negative return code, so this is not a > 0 test.
     if rc != 0:
         error = _first_error(log_path)
         logger.error(f'{target} failed, check the log in {log_path}'

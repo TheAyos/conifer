@@ -128,12 +128,11 @@ def _compile_metrics(work_dir, report):
 
 
 def _invocation_period_ns(sim_dir, W):
-    """One group's last output to the next group's -- METRICS.md's invocation_period
+    """One group's last output to the next group's
 
     Measured from the same output timestamps as latency_ss. Taken from the last word of
     a group rather than the first, so it includes the time the port spends draining the
-    group it just finished; a period taken between groups omits that and understates
-    what a sample waits.
+    group it just finished.
     """
     path = os.path.join(sim_dir, 'scores.dat')
     if not (W and os.path.isfile(path)):
@@ -146,9 +145,8 @@ def _invocation_period_ns(sim_dir, W):
 def _throughput(sim_dir, meta, n_tiles, split_axis, ghz, report):
     """Steady-state cost of a sample, from the period the array holds
 
-    A tree-split invocation scores W samples on every tile at once; a sample-split one
-    scores W on each of n_tiles. Which it is, is what the estimate divides by too, so
-    the two numbers are of the same thing.
+    A tree-split invocation scores W samples on every tile at once. A sample-split one
+    scores W on each of the tiles. Which it is, is what the estimate divides by too.
     """
     W = meta.get('config', {}).get('vector_width')
     per = _invocation_period_ns(sim_dir, W)
@@ -164,8 +162,7 @@ def _throughput(sim_dir, meta, n_tiles, split_axis, ghz, report):
     report['n_invocations'] = int(len(per)) + 1
     report['throughput_ns_per_sample'] = float(np.median(per) / samples_per_invocation)
     if 'cyc_per_sample' in report:
-        # What a sample costs beyond the kernel's own time: the array's I/O, now that
-        # the graph's fixed startup is no longer folded in with it.
+        # What a sample costs beyond the kernel's own time: the array's I/O...
         report['io_ns_per_sample'] = float(
             report['throughput_ns_per_sample'] - report['cyc_per_sample'] / ghz)
 
@@ -184,22 +181,15 @@ def _build_metrics(sim_dir, meta, report):
         logger.warning(f'{len(cores)} cores active but the model declares {n_tiles} tiles; '
                        f'an idle tile would read as a speedup')
     if n_samples:
-        # Divided by what the ARRAY retired, not the tile's own share, so both axes
-        # report the same thing and the estimate can be compared against it.
         cps = np.asarray([c['cyc'] for c in cores]) / n_samples
         report['cyc_per_sample'] = float(cps.max())
         report['cyc_per_sample_avg'] = float(cps.mean())
-        # 1.0 is a perfectly balanced array; 1.05 means the busiest tile does 5% more.
+        # 1.0 is a perfectly balanced array, 1.05 means the busiest tile does 5% more work
         report['slowest_tile_ratio'] = float(cps.max() / cps.mean()) if cps.mean() else None
         total = max(c['total'] for c in cores)
         report['total_cyc'] = total
         # Every cycle of the core's run. Its excess over the kernel's own time is a
-        # fixed graph startup and teardown -- 7300 to 9600 cycles whatever the model,
-        # measured across this backend's projects and the research artifacts alike --
-        # so dividing it by the sample count reports that constant more than the
-        # design: +18.7 cyc/sample over 512 samples, +62.7 over 128. METRICS.md keeps
-        # it (as samples_per_cycle) with n_samples as a control variable. Nothing
-        # controls n_samples here, so it is not the headline.
+        # fixed graph startup and teardown, around 7300 to 9600 cycles for the examples
         report['run_ns_per_sample'] = float(total / ghz / n_samples)
         _throughput(sim_dir, meta, n_tiles, split_axis, ghz, report)
 
@@ -207,7 +197,7 @@ def _build_metrics(sim_dir, meta, report):
     if not per_call_ns.size:
         return
     if len(cores) == 1 or split_axis == 'sample':
-        # A group lives on one tile, so its residence is that tile's own invocation.
+        # A group lives on one tile, so its residence == tile's own invocation
         report['latency_ss_ns'] = float(per_call_ns.mean())
         report['latency_ss_sd_ns'] = float(per_call_ns.std())
         report['latency_ss_drift_ns_per_group'] = 0.0
@@ -250,8 +240,6 @@ def _summarise_latency(lat, report, offset=0, note=''):
         report['latency_ss_note'] = (f'unmeasured: {len(lat)} steady-state groups, under '
                                      f'the {MIN_STEADY_GROUPS} required')
         return
-    # The intercept is referenced to the FIRST group of the run, not to the first
-    # surviving the trim, or a trimmed window would report its own accumulated skew.
     drift = _slope_per_group(lat)
     mid = offset + (len(lat) - 1) / 2.0
     intercept = float(np.mean(lat)) - drift * mid
@@ -263,17 +251,13 @@ def _summarise_latency(lat, report, offset=0, note=''):
     if sd > 0.10 * intercept:
         note = (note + '; ' if note else '') + (
             f'latency_ss scatters {sd:.0f} ns about its fit, '
-            f'{100 * sd / intercept:.0f}% of the intercept - not a line plus noise')
+            f'{100 * sd / intercept:.0f}% of the intercept')
     if note:
         report['latency_ss_note'] = note
 
 
 def _tree_split_latency(sim_dir, cores, per_call_ns, meta, report):
-    """Residence of a group across the array, from the per-tile output timestamps
-
-    Every tile emits its own partial, so the first word a group needs and the last it
-    produces are both observable: no tap port is required.
-    """
+    """Residence of a group across the array, from the per-tile output timestamps"""
     n = len(cores)
     W = meta.get('config', {}).get('vector_width') or meta.get('n_samples')
     files = [os.path.join(sim_dir, 'scores.dat' if i == 0 else f'scores.t{i}.dat')
@@ -298,15 +282,14 @@ def _tree_split_latency(sim_dir, cores, per_call_ns, meta, report):
         return
     out = np.asarray([t[:g] for t in lasts])
     lat = out.max(axis=0) - (out - per_call_ns[:, None]).min(axis=0)
-    # Drop the groups that fill the array and the ones that drain it - a small slice,
-    # since a PLIO merge has no chain to fill.
+    # Drop the groups that fill the array and the ones that drain it
     skip = min(len(lat) // 8, max(0, (len(lat) - MIN_STEADY_GROUPS) // 2))
     trimmed = lat[skip:len(lat) - skip] if skip else lat
     _summarise_latency(trimmed, report, offset=skip)
 
 
 def _tile_order(cores, n):
-    """Cores come back in placement order; the output ports are in tile order"""
+    """Cores come back in placement order the output ports are in tile order"""
     idx = []
     for c in cores:
         m = re.search(r'_tile_(\d+)$', c['name'])
@@ -319,8 +302,7 @@ def _tile_order(cores, n):
 def read_aie_report(output_dir) -> dict:
     '''Read whatever stage of AI Engine report is present
 
-    Never raises for a missing later stage: the returned 'stage' says what was found,
-    and 'next_step' says what to run for more.
+    The returned 'stage' says what was found, and 'next_step' says what to run for more.
     '''
     report = {'stage': 'write'}
     meta_path = os.path.join(output_dir, 'aie_model.json')

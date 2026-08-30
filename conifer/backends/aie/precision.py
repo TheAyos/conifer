@@ -3,16 +3,14 @@ import numpy as np
 import logging
 logger = logging.getLogger(__name__)
 
-# The compare path is declared int16 throughout and the accumulator tag is acc32, so
-# neither width is a free choice.
+# The compare path is int16 throughout the kernels and the accumulator is acc32,
+# the only fully tested widths for now
 SUPPORTED_WIDTHS = (8, 16, 32)
 COMPARE_WIDTH = 16
 SCORE_WIDTH = 32
 
 _C_TYPE = {8: 'int8_t', 16: 'int16_t', 32: 'int32_t'}
 
-# AP_RND_CONV is round-to-nearest-ties-to-even and AP_SAT saturates, which is exactly
-# numpy rint followed by clip. Any other pair would put the kernel on an unsupported grid.
 REQUIRED_ROUNDING = 'AP_RND_CONV'
 REQUIRED_OVERFLOW = 'AP_SAT'
 
@@ -22,6 +20,7 @@ _AP_FIXED = re.compile(r'^\s*ap_(u?)fixed\s*<([^>]*)>\s*$')
 class Precision:
     '''One conifer ap_fixed type, as the kernels need it: a width and a binary point'''
 
+    # TODO: improve by taking W,I directly instead of ap_fixed?
     def __init__(self, type_string):
         self.type_string = type_string
         m = _AP_FIXED.match(type_string)

@@ -1,16 +1,18 @@
-import numpy as np
 import logging
+
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 LEAF = -2
 
 # One vector of tail slack on the term tables, so the kernel's unrolled reads never run
-# off the end.
+# off the end
 _TERM_PAD = 64
 
 
 def tree_depth(tree):
-    '''Deepest leaf, root at depth 0'''
+    """Deepest leaf, root at depth 0"""
     best, stack = 0, [(0, 0)]
     while stack:
         n, d = stack.pop()
@@ -23,7 +25,7 @@ def tree_depth(tree):
 
 
 def _leaf_layout(tree):
-    '''Left-to-right leaf numbering, and each internal node's left-subtree leaf range'''
+    """Left-to-right leaf numbering, and each internal node's left-subtree leaf range"""
     leaf_nodes, left_ranges = [], {}
 
     def visit(n):
@@ -41,11 +43,11 @@ def _leaf_layout(tree):
 
 
 def build_pair_basis(qt_w, max_terms_floor=1):
-    '''Every distinct signed feature pair, so a node becomes ceil(nnz/2) adds
+    """Every distinct signed feature pair
 
     Canonical up to global sign: (i,j,+1,-1) is the negation of (i,j,-1,+1), so one is
     stored and the other references it with sign -1.
-    '''
+    """
     seen, b_i, b_j, b_wi, b_wj, terms = {}, [], [], [], [], []
 
     def entry(i, j, wi, wj):
@@ -86,25 +88,26 @@ def build_pair_basis(qt_w, max_terms_floor=1):
             bterm[slot * max_terms + a] = b
             bsign[slot * max_terms + a] = sg
 
-    return {'basis_i': np.asarray(b_i, dtype=np.int64),
-            'basis_j': np.asarray(b_j, dtype=np.int64),
-            'basis_wi': np.asarray(b_wi, dtype=np.int64),
-            'basis_wj': np.asarray(b_wj, dtype=np.int64),
-            'qt_bterm': bterm,
-            'qt_bsign': bsign,
-            'max_terms': max_terms,
-            'true_max_terms': true_max_terms,
-            'basis_n': len(b_i),
-            }
+    return {
+        "basis_i": np.asarray(b_i, dtype=np.int64),
+        "basis_j": np.asarray(b_j, dtype=np.int64),
+        "basis_wi": np.asarray(b_wi, dtype=np.int64),
+        "basis_wj": np.asarray(b_wj, dtype=np.int64),
+        "qt_bterm": bterm,
+        "qt_bsign": bsign,
+        "max_terms": max_terms,
+        "true_max_terms": true_max_terms,
+        "basis_n": len(b_i),
+    }
 
 
 class QuickScorerTables:
-    '''The QuickScorer tables the AIE kernels read, built from a conifer ensemble
+    """The QuickScorer tables the AIE kernels read, built from a conifer ensemble
 
     Grouping is by the compared quantity: a feature for an axis-aligned split, the
     projection vector for an oblique one, which keeps each group's false nodes a prefix
-    and reduces to the paper's construction when every weight row is one-hot.
-    '''
+    and reduces to the paper's construction when every weight row is one-hot
+    """
 
     def __init__(self, trees, n_features, oblique=False, weight_precision=None):
         self.n_features = n_features
@@ -113,7 +116,7 @@ class QuickScorerTables:
         self.trees = trees
         self.n_trees = len(trees)
         if oblique and weight_precision is None:
-            raise ValueError('an oblique model needs a weight precision to group by')
+            raise ValueError("an oblique model needs a weight precision to group by")
         self.max_depth = max(tree_depth(t) for t in trees)
         self._build()
 
@@ -182,12 +185,12 @@ class QuickScorerTables:
         self.init_v = [(1 << len(lv)) - 1 for lv in leaf_values]
         self.leaves = np.zeros((self.n_trees, self.max_leaves), dtype=np.float64)
         for h, lv in enumerate(leaf_values):
-            self.leaves[h, :len(lv)] = lv
+            self.leaves[h, : len(lv)] = lv
 
         self._regroup_tree_major()
 
     def _regroup_tree_major(self):
-        '''The same nodes tree by tree. The ANDs commute, so the score is unchanged'''
+        """The same nodes tree by tree. The ANDs commute, so the score is unchanged"""
         self.nodes_per_tree = (1 << self.max_depth) - 1
         n_slots = self.n_trees * self.nodes_per_tree
         all_ones = (1 << self.bv_bits) - 1
@@ -201,8 +204,9 @@ class QuickScorerTables:
             j = fill[h]
             if j >= self.nodes_per_tree:
                 raise ValueError(
-                    f'Tree {h} has more than {self.nodes_per_tree} internal nodes, which is '
-                    f'the most a depth-{self.max_depth} tree can have')
+                    f"Tree {h} has more than {self.nodes_per_tree} internal nodes, which is "
+                    f"the most a depth-{self.max_depth} tree can have"
+                )
             slot = h * self.nodes_per_tree + j
             self.qt_group[slot] = self.group_of[i]
             self.qt_thr_f[slot] = float(self.thresholds[i])
@@ -213,7 +217,7 @@ class QuickScorerTables:
         self.n_slots = n_slots
 
     def qt_weight_rows(self):
-        '''Per-slot quantized weight rows; a padding slot is all zero, so it projects to 0'''
+        """Per-slot quantized weight rows; a padding slot is all zero, so it projects to 0"""
         rows = np.zeros((self.n_slots, self.n_features), dtype=np.int64)
         for slot in range(self.n_slots):
             if self.qt_used[slot]:
@@ -238,19 +242,27 @@ class QuickScorerTables:
         return len(self.group_rows)
 
     def quantize(self, threshold_precision, score_precision, norm=1.0):
-        '''Quantized copies of every table that carries a real number'''
-        return {'thresholds': threshold_precision.quantize(self.thresholds),
-                'qt_thr': threshold_precision.quantize(np.asarray(self.qt_thr_f)),
-                'leaves': score_precision.quantize(self.leaves * norm),
-                }
+        """Quantized copies of every table that carries a real number"""
+        return {
+            "thresholds": threshold_precision.quantize(self.thresholds),
+            "qt_thr": threshold_precision.quantize(np.asarray(self.qt_thr_f)),
+            "leaves": score_precision.quantize(self.leaves * norm),
+        }
 
-    def replay(self, X, threshold_precision, score_precision, init_predict, norm=1.0,
-               split_le=True):
-        '''Score X exactly as the kernel does, on the quantized tables'''
+    def replay(
+        self,
+        X,
+        threshold_precision,
+        score_precision,
+        init_predict,
+        norm=1.0,
+        split_le=True,
+    ):
+        """Score X exactly as the kernel does, on the quantized tables"""
         q = self.quantize(threshold_precision, score_precision, norm)
         xq = threshold_precision.quantize(X)
         init_q = int(score_precision.quantize([float(init_predict) * norm])[0])
-        qt_thr, leaves_q = q['qt_thr'], q['leaves']
+        qt_thr, leaves_q = q["qt_thr"], q["leaves"]
         wgt_shift = self.weight_precision.shift if self.oblique else 0
         rows = self.qt_weight_rows() if self.oblique else None
 
