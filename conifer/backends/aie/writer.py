@@ -105,10 +105,8 @@ class AIEConfig(MultiPrecisionConfig):
             raise ValueError(
                 f"priority must be 'latency' or 'throughput', got '{self.priority}'"
             )
-        if self.shard not in (AUTO, "fast", True, False, "false", "off"):
-            raise ValueError(
-                f"shard must be '{AUTO}', 'fast' or False, got '{self.shard}'"
-            )
+        if self.shard not in (AUTO, True, False, "false", "off"):
+            raise ValueError(f"shard must be '{AUTO}' or False, got '{self.shard}'")
         if self.feed not in (AUTO, "memtile", "plio"):
             raise ValueError(
                 f"feed must be 'memtile', 'plio' or '{AUTO}', got '{self.feed}'"
@@ -176,7 +174,6 @@ class AIEModel(ModelBase):
             return
         if self.family != "axis" or self.split_axis != "tree" or self.n_tiles < 2:
             return
-        mode = self.config.shard
         # Sharding hands each tile a different row window, which only the memtile can
         # deliver: a multicast PLIO gives every tile the same stream
         if self.config.feed == "plio":
@@ -189,7 +186,7 @@ class AIEModel(ModelBase):
             self.n_trees_padded,
             self.n_features_padded,
             self.n_tiles,
-            optimize="fast" if mode == "fast" else "search",
+            optimize="search",
         )
         self._verify_sharding()
         self.feed_memtile = True

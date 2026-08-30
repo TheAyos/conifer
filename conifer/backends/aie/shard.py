@@ -120,36 +120,6 @@ def search_span(
     return best[1], best[2]
 
 
-def refine(groups, fperm, tree_feats, n_features, rounds=6):
-    """Descend on the widest tile window by swapping trees, then feature positions"""
-    groups = [list(g) for g in groups]
-    fperm = list(fperm)
-    best = _cost(groups, tree_feats, fperm)
-    for _ in range(rounds):
-        moved = False
-        for a in range(len(groups)):
-            for b in range(a + 1, len(groups)):
-                for i in range(len(groups[a])):
-                    for j in range(len(groups[b])):
-                        groups[a][i], groups[b][j] = groups[b][j], groups[a][i]
-                        c = _cost(groups, tree_feats, fperm)
-                        if c < best:
-                            best, moved = c, True
-                        else:
-                            groups[a][i], groups[b][j] = groups[b][j], groups[a][i]
-        for p in range(n_features):
-            for q in range(p + 1, n_features):
-                fperm[p], fperm[q] = fperm[q], fperm[p]
-                c = _cost(groups, tree_feats, fperm)
-                if c < best:
-                    best, moved = c, True
-                else:
-                    fperm[p], fperm[q] = fperm[q], fperm[p]
-        if not moved:
-            break
-    return [sorted(g) for g in groups], fperm
-
-
 class Sharding:
     """Trees assigned to tiles, with each tile's feature rows a contiguous window
 
@@ -187,10 +157,6 @@ class Sharding:
                 if fperm
                 else feature_permutation(self.groups, self.tree_feats, n_features)
             )
-            if chosen and optimize:
-                self.groups, self.fperm = refine(
-                    self.groups, self.fperm, self.tree_feats, n_features
-                )
         if sorted(h for g in self.groups for h in g) != list(range(n_trees)):
             raise ValueError("the tree assignment is not a partition of the ensemble")
         if sorted(self.fperm) != list(range(n_features)):
